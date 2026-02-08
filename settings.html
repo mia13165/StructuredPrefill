@@ -1,0 +1,41 @@
+<div class="structuredprefill_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>StructuredPrefill settings</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+
+        <div class="inline-drawer-content">
+            <div class="structuredprefill-settings-group">
+                <strong class="structuredprefill-center-text">General</strong>
+                <div class="flex-container">
+                    <label class="flex-container">
+                        <input type="checkbox" id="structuredprefill_enabled">
+                        <small>Enabled StructuredPrefill</small>
+                    </label>
+                </div>
+
+                <div class="flex-container">
+                    <label class="flex-container">
+                        <input type="checkbox" id="structuredprefill_hide_prefill_in_display">
+                        <small>Hide the prefill text in the final message</small>
+                    </label>
+                </div>
+            </div>
+
+            <div class="structuredprefill-settings-group">
+                <strong class="structuredprefill-center-text">Advanced</strong>
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_min_chars_after_prefix">Minimum characters after prefix</label>
+                    <input id="structuredprefill_min_chars_after_prefix" class="text_pole" type="number" min="1" max="10000" step="1" autocomplete="off">
+                </div>
+
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_newline_token">Newline token (encoded in schema)</label>
+                    <input id="structuredprefill_newline_token" class="text_pole" type="text" autocomplete="off" placeholder="&lt;NL&gt;">
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>

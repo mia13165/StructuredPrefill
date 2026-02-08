@@ -1,0 +1,13 @@
+{
+    "display_name": "StructuredPrefill",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "styles.css",
+    "author": "",
+    "version": "0.0.1",
+    "homePage": "",
+    "description": "Blank placeholder extension (settings scaffold).",
+    "auto_update": false
+}

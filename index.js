@@ -22,6 +22,13 @@ const runtimeState = {
     expectedPrefill: '',
     newlineToken: '',
     patternMode: 'default',
+    continue: {
+        active: false,
+        messageId: -1,
+        baseText: '',
+        stripLiteral: '',
+        stripRegex: null,
+    },
     hidePrefillLiteral: '',
     hidePrefillRegex: null,
     streamObserver: null,
@@ -110,8 +117,8 @@ function schedulePostFrameGuard(messageId) {
         const textEl = document.querySelector(`.mes[mesid="${messageId}"] .mes_text`);
         const domText = textEl instanceof HTMLElement ? String(textEl.textContent ?? '') : '';
         // If ST’s own streaming renderer overwrote us after our observer pass, stomp JSON again.
-        const domLooksLikeStructuredJson = domText.trimStart().startsWith('{') && domText.includes('"value"');
-        if (domLooksLikeStructuredJson && typeof runtimeState.lastAppliedText === 'string') {
+        const domContainsStructuredJson = looksLikeStructuredJsonBlob(domText);
+        if (domContainsStructuredJson && typeof runtimeState.lastAppliedText === 'string') {
             applyTextToMessageStreaming(messageId, runtimeState.lastAppliedText);
         }
     });
@@ -174,9 +181,42 @@ function prefixHasSlots(prefix) {
     return /\[\[[^\]]+?\]\]/.test(String(prefix ?? ''));
 }
 
+function looksLikeStructuredJsonBlob(text) {
+    const s = String(text ?? '');
+    if (!s.includes('{') || !s.includes('"')) return false;
+    // Detect our JSON wrapper even if it appears *after* a Continue base message ("Foo... {\"value\":\"...\"}").
+    return /\{\s*"(?:value|prefix|content)"\s*:/.test(s);
+}
+
 function clearHidePrefillState() {
     runtimeState.hidePrefillLiteral = '';
     runtimeState.hidePrefillRegex = null;
+}
+
+function clearContinueState() {
+    runtimeState.continue.active = false;
+    runtimeState.continue.messageId = -1;
+    runtimeState.continue.baseText = '';
+    runtimeState.continue.stripLiteral = '';
+    runtimeState.continue.stripRegex = null;
+}
+
+function getLastAssistantMessageId() {
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (!m) continue;
+        if (m.is_user) continue;
+        if (m.is_system) continue;
+        return i;
+    }
+    return -1;
+}
+
+function getActiveAssistantMessageIdForStreaming() {
+    const id = runtimeState.continue.active ? runtimeState.continue.messageId : (chat.length - 1);
+    if (Number.isInteger(id) && id >= 0 && id < chat.length && !chat[id]?.is_user && !chat[id]?.is_system) return id;
+    const last = getLastAssistantMessageId();
+    return last >= 0 ? last : (chat.length - 1);
 }
 
 function resetStreamGuard() {
@@ -348,6 +388,29 @@ function buildPrefillStripper(prefixTemplate) {
     }
 }
 
+function buildContinueStripper(prefixTemplate) {
+    const normalized = normalizeNewlines(prefixTemplate);
+    if (!normalized) return;
+
+    // For Continue, we always strip the *entire* structured prefix from the model output delta, then re-prepend the
+    // real chat message text from ST (so we keep the message being continued, without duplicating it).
+    if (!prefixHasSlots(normalized)) {
+        runtimeState.continue.stripLiteral = normalized;
+        runtimeState.continue.stripRegex = null;
+        return;
+    }
+
+    const prefixRegex = buildPrefixRegexFromWireTemplate(normalized);
+    try {
+        runtimeState.continue.stripRegex = new RegExp(`^((?:${prefixRegex}))`);
+        runtimeState.continue.stripLiteral = '';
+    } catch (err) {
+        console.warn(`[${extensionName}] Failed to build continue-strip regex; falling back to literal stripping only.`, err);
+        runtimeState.continue.stripRegex = null;
+        runtimeState.continue.stripLiteral = normalized;
+    }
+}
+
 function maybeHidePrefillForDisplay(text) {
     const settings = extension_settings[extensionName];
     if (!settings?.hide_prefill_in_display) return text;
@@ -365,6 +428,148 @@ function maybeHidePrefillForDisplay(text) {
     const literal = String(runtimeState.hidePrefillLiteral ?? '');
     if (literal && normalized.startsWith(literal)) {
         return normalized.slice(literal.length);
+    }
+
+    return normalized;
+}
+
+function canonicalizeForContinueMatch(text) {
+    const input = normalizeNewlines(String(text ?? ''));
+    let out = '';
+    for (let i = 0; i < input.length; i++) {
+        const ch = input[i];
+        switch (ch) {
+            case '\u00A0': out += ' '; break; // nbsp
+            case '\u201C':
+            case '\u201D':
+                out += '"';
+                break;
+            case '\u2018':
+            case '\u2019':
+                out += '\'';
+                break;
+            case '\u2010':
+            case '\u2011':
+            case '\u2012':
+            case '\u2013':
+            case '\u2014':
+                out += '-';
+                break;
+            default:
+                out += ch;
+                break;
+        }
+    }
+    return out.toLowerCase();
+}
+
+function stripContinuePrefix(text) {
+    if (!runtimeState.continue.active) return text;
+    if (typeof text !== 'string' || text.length === 0) return text;
+
+    const normalized = normalizeNewlines(text);
+
+    if (runtimeState.continue.stripRegex instanceof RegExp) {
+        const m = runtimeState.continue.stripRegex.exec(normalized);
+        if (m && typeof m[1] === 'string') {
+            return normalized.slice(m[1].length);
+        }
+    }
+
+    const literal = String(runtimeState.continue.stripLiteral ?? '');
+    if (literal && normalized.startsWith(literal)) {
+        return normalized.slice(literal.length);
+    }
+
+    const canonicalize = (s) => {
+        const input = normalizeNewlines(String(s ?? ''));
+        let out = '';
+        for (let i = 0; i < input.length; i++) {
+            const ch = input[i];
+            switch (ch) {
+                case '\u00A0': out += ' '; break; // nbsp
+                case '\u201C': // “
+                case '\u201D': // ”
+                    out += '"';
+                    break;
+                case '\u2018': // ‘
+                case '\u2019': // ’
+                    out += '\'';
+                    break;
+                case '\u2010': // ‐
+                case '\u2011': // ‑
+                case '\u2012': // ‒
+                case '\u2013': // –
+                case '\u2014': // —
+                    out += '-';
+                    break;
+                default:
+                    out += ch;
+                    break;
+            }
+        }
+        return out.toLowerCase();
+    };
+
+    // Fallback for providers that don't strictly enforce the prefix regex (so we can't regex-strip reliably):
+    // try to locate the end of the *existing* message text within the decoded value and strip up to it.
+    const base = String(runtimeState.continue.baseText ?? '');
+    if (base) {
+        const baseCanon = canonicalizeForContinueMatch(base);
+        const textCanon = canonicalizeForContinueMatch(normalized);
+
+        // If the decoded value starts with the base message (modulo canonicalization), strip by length.
+        // This avoids "doubling" when providers don't strictly enforce the schema prefix.
+        if (baseCanon.length >= 40 && textCanon.startsWith(baseCanon)) {
+            return normalized.slice(baseCanon.length);
+        }
+
+        const tryTailLen = (tailLen) => {
+            const len = Math.min(tailLen, baseCanon.length, textCanon.length);
+            if (len < 20) return null;
+            const needle = baseCanon.slice(baseCanon.length - len);
+            const expected = Math.max(0, baseCanon.length - len);
+
+            let bestPos = -1;
+            let bestScore = Number.POSITIVE_INFINITY;
+            let start = 0;
+            while (true) {
+                const pos = textCanon.indexOf(needle, start);
+                if (pos === -1) break;
+                const score = Math.abs(pos - expected);
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestPos = pos;
+                    // Good enough; don't scan forever.
+                    if (bestScore === 0) break;
+                }
+                start = pos + 1;
+            }
+
+            if (bestPos >= 0) {
+                const cut = bestPos + len;
+                if (cut >= 0 && cut <= normalized.length) return normalized.slice(cut);
+            }
+
+            return null;
+        };
+
+        // Prefer longer overlaps, but fall back progressively.
+        const maxLen = Math.min(520, baseCanon.length, textCanon.length);
+        for (let len = maxLen; len >= 40; len -= 20) {
+            const candidate = tryTailLen(len);
+            if (typeof candidate === 'string') return candidate;
+        }
+
+        const candidate = (
+            tryTailLen(220) ??
+            tryTailLen(140) ??
+            tryTailLen(90) ??
+            tryTailLen(60) ??
+            tryTailLen(40)
+        );
+
+        if (typeof candidate === 'string') return candidate;
     }
 
     return normalized;
@@ -608,7 +813,17 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix) {
     // - starts with wirePrefix
     // - continuation (after prefix) has at least `minChars` characters
     // - continuation contains at least one non-whitespace character (prevents whitespace padding)
-    const prefixRegex = buildPrefixRegexFromWireTemplate(wirePrefix);
+    let prefixRegex = buildPrefixRegexFromWireTemplate(wirePrefix);
+
+    // Robust newline handling:
+    // Some models/providers will emit real newlines in the parsed JSON string instead of the chosen newline token.
+    // If we require `<NL>` literally, the model can get stuck trying to satisfy the schema. Allow either.
+    if (newlineToken) {
+        const escapedToken = escapeRegExp(newlineToken);
+        // Replace literal occurrences of the encoded token in the prefix regex with an alternation.
+        // NOTE: This is a string replace on the regex *source*.
+        prefixRegex = prefixRegex.split(escapedToken).join(`(?:${escapedToken}|\\n)`);
+    }
     // Avoid lookaheads for broader provider compatibility.
     //
     // Provider differences:
@@ -624,7 +839,13 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix) {
         pattern = `^(?:${prefixRegex})${anyChar}*[^\\s]${anyChar}*$`;
     } else {
         // Avoid `\S` / `[\s\S]` because some providers reject `\S` in schema patterns.
-        pattern = `^(?:${prefixRegex})${anyChar}{${minMinusOne},}[^\\s]${anyChar}*$`;
+        //
+        // IMPORTANT:
+        // Do NOT force a non-whitespace character at a specific position after the prefix.
+        // That can deadlock on "newline-y" continuations (e.g. the model wants to start a new paragraph
+        // right after the minimum length, but the regex requires a non-whitespace there).
+        // Length-only is enough; the stream guard already protects against pathological padding loops.
+        pattern = `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
     }
 
     // Best-effort local validation so a bad directive regex doesn't brick generation.
@@ -635,7 +856,7 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix) {
         console.warn(`[${extensionName}] Invalid injected regex pattern; falling back to a minimal-safe pattern.`, err);
         pattern = runtimeState.patternMode === 'anthropic'
             ? `^(?:${prefixRegex})${anyChar}*[^\\s]${anyChar}*$`
-            : `^(?:${prefixRegex})${anyChar}{${minMinusOne},}[^\\s]${anyChar}*$`;
+            : `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
     }
 
     return {
@@ -730,19 +951,41 @@ function tryUnwrapStructuredOutput(text) {
     if (typeof text !== 'string' || text.length === 0) return null;
 
     const decode = (s) => decodeNewlines(s, runtimeState.newlineToken);
+    const applyContinueJoin = (decodedValue) => {
+        const s = String(decodedValue ?? '');
+        if (!runtimeState.continue.active) return s;
+        const base = String(runtimeState.continue.baseText ?? '');
+        if (!base) return s;
+
+        const delta = stripContinuePrefix(s);
+        if (delta !== s) return base + delta;
+
+        // If stripping failed but the model already returned the full message (base + continuation),
+        // do NOT prepend `base` again (that causes doubled output).
+        const baseCanon = canonicalizeForContinueMatch(base);
+        const textCanon = canonicalizeForContinueMatch(s);
+        const probe = Math.min(120, baseCanon.length, textCanon.length);
+        if (probe >= 40 && textCanon.startsWith(baseCanon.slice(0, probe))) {
+            return s;
+        }
+
+        return base + s;
+    };
 
     try {
         const parsed = JSON.parse(text);
         if (parsed && typeof parsed === 'object') {
             if (typeof parsed.value === 'string') {
                 // Back-compat with older schema.
-                return maybeHidePrefillForDisplay(decode(parsed.value));
+                const decoded = decode(parsed.value);
+                return runtimeState.continue.active ? applyContinueJoin(decoded) : maybeHidePrefillForDisplay(decoded);
             }
             if (typeof parsed.prefix === 'string' || typeof parsed.content === 'string') {
                 const prefix = typeof parsed.prefix === 'string' ? decode(parsed.prefix) : '';
                 const content = typeof parsed.content === 'string' ? decode(parsed.content) : '';
                 const joined = prefix + content;
-                return joined.length > 0 ? maybeHidePrefillForDisplay(joined) : '';
+                if (joined.length === 0) return '';
+                return runtimeState.continue.active ? applyContinueJoin(joined) : maybeHidePrefillForDisplay(joined);
             }
             // Back-compat with the previous multi-field attempt.
             if (typeof parsed.content === 'string') return String(runtimeState.expectedPrefill ?? '') + parsed.content;
@@ -753,13 +996,17 @@ function tryUnwrapStructuredOutput(text) {
 
     // Back-compat: single-field schema.
     const legacy = tryExtractJsonStringField(text, 'value');
-    if (typeof legacy === 'string') return maybeHidePrefillForDisplay(decode(legacy));
+    if (typeof legacy === 'string') {
+        const decoded = decode(legacy);
+        return runtimeState.continue.active ? applyContinueJoin(decoded) : maybeHidePrefillForDisplay(decoded);
+    }
 
     const prefix = tryExtractJsonStringField(text, 'prefix');
     const content2 = tryExtractJsonStringField(text, 'content');
     if (typeof prefix === 'string' || typeof content2 === 'string') {
         const joined = decode(prefix ?? '') + decode(content2 ?? '');
-        return joined.length > 0 ? maybeHidePrefillForDisplay(joined) : '';
+        if (joined.length === 0) return '';
+        return runtimeState.continue.active ? applyContinueJoin(joined) : maybeHidePrefillForDisplay(joined);
     }
 
     // Back-compat with the previous multi-field attempt.
@@ -954,9 +1201,9 @@ function scheduleDecodedRender(messageId) {
         }
         const textEl = document.querySelector(`.mes[mesid="${messageId}"] .mes_text`);
         const domText = textEl instanceof HTMLElement ? String(textEl.textContent ?? '') : '';
-        const domLooksLikeStructuredJson = domText.trimStart().startsWith('{') && domText.includes('"value"');
+        const domContainsStructuredJson = looksLikeStructuredJsonBlob(domText);
         // If ST just overwrote the DOM with raw JSON, we need to re-apply even if the decoded text didn’t change.
-        if (unwrapped === runtimeState.lastAppliedText && !domLooksLikeStructuredJson) return;
+        if (unwrapped === runtimeState.lastAppliedText && !domContainsStructuredJson) return;
         runtimeState.lastAppliedText = unwrapped;
         applyTextToMessageStreaming(messageId, unwrapped);
     });
@@ -1008,6 +1255,9 @@ function touchStopCleanup(messageId, sessionAtStop) {
         runtimeState.stopping = false;
         disconnectStreamObserver();
         clearStopCleanupTimer();
+        clearHidePrefillState();
+        clearContinueState();
+        resetStreamGuard();
     }, 250);
 }
 
@@ -1021,6 +1271,9 @@ function onChatCompletionSettingsReady(generateData) {
     // Avoid conflicts with tool-calling in early testing; can be revisited later.
     if (Array.isArray(generateData.tools) && generateData.tools.length > 0) return;
 
+    const requestType = String(generateData.type ?? '').toLowerCase();
+    const isContinue = requestType === 'continue';
+
     const messages = generateData.messages;
     if (!Array.isArray(messages) || messages.length === 0) return;
 
@@ -1030,33 +1283,125 @@ function onChatCompletionSettingsReady(generateData) {
     // OpenRouter is OpenAI-compatible. Some routed providers/models may ignore or partially enforce `json_schema`.
     // We still attempt injection for any OpenRouter model and let it be a no-op if the backend doesn't enforce it.
 
-    // Always require the last message to be an assistant-role prefill.
-    const last = messages[messages.length - 1];
-    if (!last || last.role !== 'assistant' || typeof last.content !== 'string') return;
-    let prefix = last.content;
-    if (!prefix) return;
+    // We only activate when the chat "tail" is an assistant message (prefill-like).
+    // For Continue, ST commonly appends a trailing system instruction, so we look at the last *non-system* message.
+    let tailIndex = messages.length - 1;
+    while (tailIndex >= 0 && messages[tailIndex]?.role === 'system') tailIndex--;
+    const tail = tailIndex >= 0 ? messages[tailIndex] : null;
+
+    if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return;
+    const tailContent = tail.content;
+    if (!tailContent) return;
 
     resetStreamGuard();
-
-    // Remove the assistant prefill message and replace it with a structured output constraint.
-    messages.pop();
-
-    // Legacy cleanup: if the user has old `[[SP: ...]]` blocks in their prefill, strip them.
-    // StructuredPrefill now uses `[[...]]` as *slots* inside the prefix template.
-    prefix = String(prefix ?? '').replace(/\[\[\s*sp\s*:[^\]]*\]\]/gi, '');
-    // SAFEGUARD:
-    // Literal `"` characters inside the prefix are very common in templates (e.g. quoting example thoughts),
-    // but in "best-effort JSON" implementations they can cause repeated premature JSON-string termination
-    // (model emits an unescaped `"` and the reply gets truncated at the same spot every time).
-    // Converting literal quotes to curly quotes avoids needing escapes and dramatically improves robustness.
-    prefix = curlyQuoteLiteralsOutsideSlots(prefix);
-
-    runtimeState.newlineToken = chooseNewlineToken(prefix, settings.newline_token);
     clearHidePrefillState();
-    if (settings.hide_prefill_in_display) buildPrefillStripper(prefix);
+    clearContinueState();
 
-    const minCharsAfterPrefix = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);
-    generateData.json_schema = buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix);
+    // Build schema + state differently for Continue vs normal generations.
+    // - Normal: remove assistant prefill and enforce it via schema.
+    // - Continue: keep (or replace) the tail assistant message so the model can see the message to continue,
+    //            and only constrain the *output wrapper* (we append to the existing message locally).
+    let schemaPrefix = '';
+    let prefillTemplate = String(tailContent ?? '');
+
+    if (isContinue) {
+        runtimeState.continue.active = true;
+        runtimeState.continue.messageId = getLastAssistantMessageId();
+        runtimeState.continue.baseText = (runtimeState.continue.messageId >= 0 && typeof chat?.[runtimeState.continue.messageId]?.mes === 'string')
+            ? chat[runtimeState.continue.messageId].mes
+            : '';
+        runtimeState.lastAppliedText = String(runtimeState.continue.baseText ?? '');
+
+        // Ensure the request includes the message we're actually continuing (not prompt-manager assistant prefill).
+        const baseText = String(runtimeState.continue.baseText ?? '');
+        if (baseText) {
+            const baseCanon = canonicalizeForContinueMatch(baseText);
+            const tailCanon = canonicalizeForContinueMatch(prefillTemplate);
+            const probe = 60;
+            const baseProbe = baseCanon.slice(0, Math.min(probe, baseCanon.length));
+            const tailProbe = tailCanon.slice(0, Math.min(probe, tailCanon.length));
+            const looksLikeBase = (baseProbe && tailCanon.startsWith(baseProbe)) || (tailProbe && baseCanon.startsWith(tailProbe));
+            if (!looksLikeBase) {
+                // If this looks like Prompt Manager assistant-prefill (often contains a `[[keep]]` marker),
+                // preserve the instruction portion as a system message, but do not "continue" that prefill.
+                const { hideTemplate, hasKeepMarker } = splitHidePrefillTemplate(prefillTemplate);
+                if (hasKeepMarker && hideTemplate) {
+                    messages.unshift({ role: 'system', content: hideTemplate });
+                }
+                tail.content = baseText;
+                try {
+                    console.debug(`[${extensionName}] Continue: replaced tail assistant content with base message (${baseText.length} chars).`);
+                } catch {
+                    // ignore
+                }
+            }
+        }
+
+        buildContinueStripper(runtimeState.continue.baseText);
+        schemaPrefix = '';
+        runtimeState.newlineToken = chooseNewlineToken(runtimeState.continue.baseText, settings.newline_token);
+    } else {
+        // Remove the assistant prefill message and replace it with a structured output constraint.
+        messages.splice(tailIndex, 1);
+
+        // Legacy cleanup: if the user has old `[[SP: ...]]` blocks in their prefill, strip them.
+        // StructuredPrefill now uses `[[...]]` as *slots* inside the prefix template.
+        prefillTemplate = String(prefillTemplate ?? '').replace(/\[\[\s*sp\s*:[^\]]*\]\]/gi, '');
+        // SAFEGUARD:
+        // Literal `"` characters inside the prefix are very common in templates (e.g. quoting example thoughts),
+        // but in "best-effort JSON" implementations they can cause repeated premature JSON-string termination
+        // (model emits an unescaped `"` and the reply gets truncated at the same spot every time).
+        // Converting literal quotes to curly quotes avoids needing escapes and dramatically improves robustness.
+        prefillTemplate = curlyQuoteLiteralsOutsideSlots(prefillTemplate);
+
+        schemaPrefix = prefillTemplate;
+        runtimeState.newlineToken = chooseNewlineToken(schemaPrefix, settings.newline_token);
+        if (settings.hide_prefill_in_display) {
+            buildPrefillStripper(schemaPrefix);
+        }
+    }
+
+    // Anthropic (including via OpenRouter) rejects structured output requests if the final message isn't `user`.
+    // For Continue, ST's "continue nudge" is usually a system message; downgrade it to `user` so it's the final message.
+    if (runtimeState.patternMode === 'anthropic' && messages.length) {
+        const defaultContinueNudge = '[Continue your last message without repeating its original content.]';
+        const findContinueNudgeSystemIndex = () => {
+            const lookback = 8;
+            for (let i = messages.length - 1; i >= 0 && i >= messages.length - lookback; i--) {
+                const msg = messages[i];
+                if (!msg || msg.role !== 'system' || typeof msg.content !== 'string') continue;
+                const c = msg.content.toLowerCase();
+                if (c.includes('continue') && c.includes('without repeating')) return i;
+                if (c.includes('continue') && c.includes('last message')) return i;
+            }
+            return -1;
+        };
+
+        const lastMsg = messages[messages.length - 1];
+        if (lastMsg?.role !== 'user') {
+            if (isContinue) {
+                // Prefer downgrading an existing nudge if present.
+                const idx = findContinueNudgeSystemIndex();
+                if (idx >= 0) {
+                    messages[idx].role = 'user';
+                    // Ensure it's the final message.
+                    if (idx !== messages.length - 1) {
+                        const moved = messages.splice(idx, 1)[0];
+                        messages.push(moved);
+                    }
+                } else {
+                    // No visible nudge found; add a user nudge (no tiny "." trigger).
+                    messages.push({ role: 'user', content: defaultContinueNudge });
+                }
+            } else {
+                messages.push({ role: 'user', content: 'Ok.' });
+            }
+        }
+    }
+
+    const minCharsSetting = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);
+    const minCharsAfterPrefix = isContinue ? 1 : minCharsSetting;
+    generateData.json_schema = buildJsonSchemaForPrefillValuePattern(schemaPrefix, minCharsAfterPrefix);
 
     // Debug: log the structured output regex pattern that we inject.
     try {
@@ -1064,8 +1409,9 @@ function onChatCompletionSettingsReady(generateData) {
         const injectedPattern = generateData?.json_schema?.value?.properties?.value?.pattern;
         if (typeof injectedPattern === 'string' && injectedPattern.length > 0) {
             console.debug(`[${extensionName}] Injected json_schema pattern (${injectedPattern.length} chars):`, injectedPattern);
+            const continueBaseLen = runtimeState.continue.active ? String(runtimeState.continue.baseText ?? '').length : 0;
             console.debug(
-                `[${extensionName}] Prefix/newline info: prefix_len=${String(prefix ?? '').length}, newline_token=${runtimeState.newlineToken}, min_chars_after_prefix=${minCharsAfterPrefix}`,
+                `[${extensionName}] Prefix/newline info: schema_prefix_len=${String(schemaPrefix ?? '').length}, continue_base_len=${continueBaseLen}, newline_token=${runtimeState.newlineToken}, min_chars_after_prefix=${minCharsAfterPrefix}`,
             );
         }
     } catch {
@@ -1077,7 +1423,7 @@ function onChatCompletionSettingsReady(generateData) {
     runtimeState.stopSessionAt = 0;
     clearStopCleanupTimer();
     runtimeState.lastInjectedAt = Date.now();
-    runtimeState.expectedPrefill = String(prefix ?? '');
+    runtimeState.expectedPrefill = String(schemaPrefix ?? '');
 }
 
 function scheduleStreamUnwrap(rawText) {
@@ -1086,7 +1432,22 @@ function scheduleStreamUnwrap(rawText) {
     if (!runtimeState.active) return;
 
     runtimeState.latestStreamText = String(rawText ?? '');
-    const messageId = chat.length - 1;
+    const messageId = getActiveAssistantMessageIdForStreaming();
+    // Reduce flicker: decode immediately and replace raw JSON before ST paints it for long.
+    try {
+        const rawStr = String(rawText ?? '');
+        const unwrapped = tryUnwrapStructuredOutput(rawStr);
+        if (typeof unwrapped === 'string') {
+            runtimeState.lastAppliedText = unwrapped;
+            applyTextToMessageStreaming(messageId, unwrapped);
+        } else if (rawStr.trimStart().startsWith('{')) {
+            // If we can't extract yet (very early tokens), never show raw JSON.
+            const fallback = typeof runtimeState.lastAppliedText === 'string' ? runtimeState.lastAppliedText : '';
+            applyTextToMessageStreaming(messageId, fallback);
+        }
+    } catch {
+        // ignore
+    }
     ensureStreamObserver(messageId);
     scheduleDecodedRender(messageId);
 }
@@ -1104,13 +1465,14 @@ function onMessageReceived(messageId) {
     clearStopCleanupTimer();
     disconnectStreamObserver();
     clearHidePrefillState();
+    clearContinueState();
     resetStreamGuard();
 }
 
 function onGenerationStopped() {
     if (!runtimeState.active) return;
 
-    const messageId = chat.length - 1;
+    const messageId = getActiveAssistantMessageIdForStreaming();
     runtimeState.stopping = true;
     runtimeState.stopSessionAt = runtimeState.lastInjectedAt;
 

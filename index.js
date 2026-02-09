@@ -8,7 +8,7 @@ const extensionPath = 'third-party/StructuredPrefill';
 
 const defaultSettings = {
     enabled: true,
-    hide_prefill_in_display: false,
+    hide_prefill_in_display: true,
     newline_token: '<NL>',
     // Require some actual continuation beyond the prefix (in chars).
     min_chars_after_prefix: 80,

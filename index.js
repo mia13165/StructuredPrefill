@@ -509,10 +509,33 @@ function stripContinueOverlapPrefix(text) {
     return normalized;
 }
 
-function buildContinueJoinPlaceholder() {
-    // The overlap is always the LAST N chars of the base text, so its end equals
-    // the natural end of the message — never cut mid-word at the join point.
-    // No constraint is needed; the model naturally continues from the overlap.
+function buildContinueJoinPlaceholder(baseText) {
+    // Returns a RAW regex fragment (not a [[...]] slot template).
+    // This is appended directly to the prefixRegex after template processing to avoid
+    // slot-parser issues with `]` inside character classes (e.g. `[^A-Z]` inside `[[re:...]]`).
+    const base = normalizeNewlines(String(baseText ?? ''));
+    if (base.length < 2) return '';
+
+    const last = base[base.length - 1];
+    const prev = base[base.length - 2];
+
+    const isAsciiLetter = (ch) => /[A-Za-z]/.test(ch);
+    const isAsciiUpper = (ch) => /[A-Z]/.test(ch);
+    const isAsciiAlphaNum = (ch) => /[A-Za-z0-9]/.test(ch);
+
+    // If the base ends with the *first letter* of a word (e.g. `"Oh, d`), force the next char to be
+    // a word-continuation character so the model completes the word instead of inserting punctuation.
+    // Allows both cases (lowercase + uppercase) to support ALL-CAPS dialogue / emphasis in roleplay.
+    if (isAsciiLetter(last) && /[\s"'""''(\[{<,.;:!?-]/.test(prev)) {
+        return "(?:[a-zA-Z\\-\\'])";
+    }
+
+    // If base ends with an alnum char (but not clearly mid-word), disallow an immediate uppercase
+    // letter as the next char.  The model can still start a new sentence by emitting whitespace first.
+    if (isAsciiAlphaNum(last) && isAsciiUpper(last) === false) {
+        return '[^A-Z]';
+    }
+
     return '';
 }
 
@@ -1981,7 +2004,7 @@ function onChatCompletionSettingsReady(generateData) {
         const overlap = computeContinueOverlapBase(baseText, overlapChars);
         runtimeState.continue.overlapText = overlap;
         buildContinueOverlapStripper(overlap);
-        joinSuffixRegex = buildContinueJoinPlaceholder();
+        joinSuffixRegex = buildContinueJoinPlaceholder(baseText);
 
         if (pmPrefix) {
             buildContinuePmStripper(pmPrefix);

@@ -939,6 +939,12 @@ function getPatternModeForRequest(source, modelId) {
         return 'anthropic';
     }
 
+    // OpenAI-compatible providers (proxies, etc.) routing to Anthropic/Claude models have the same
+    // strict regex limitations. Detect by model name.
+    if (model.includes('claude') || model.includes('anthropic')) {
+        return 'anthropic';
+    }
+
     return 'default';
 }
 

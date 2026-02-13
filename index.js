@@ -13,6 +13,8 @@ const defaultSettings = {
     newline_token: '<NL>',
     // Require some actual continuation beyond the prefix (in chars).
     min_chars_after_prefix: 80,
+    // Number of characters from the end of the existing message used as overlap for Continue.
+    continue_overlap_chars: 14,
 };
 
 const runtimeState = {
@@ -507,40 +509,10 @@ function stripContinueOverlapPrefix(text) {
     return normalized;
 }
 
-function buildContinueJoinPlaceholder(baseText) {
-    // Returns a RAW regex fragment (not a [[...]] slot template).
-    // This is appended directly to the prefixRegex after template processing to avoid
-    // slot-parser issues with `]` inside character classes (e.g. `[^A-Z]` inside `[[re:...]]`).
-    const base = normalizeNewlines(String(baseText ?? ''));
-    if (base.length < 2) return '';
-
-    const last = base[base.length - 1];
-    const prev = base[base.length - 2];
-
-    const isAsciiLetter = (ch) => /[A-Za-z]/.test(ch);
-    const isAsciiUpper = (ch) => /[A-Z]/.test(ch);
-    const isAsciiAlphaNum = (ch) => /[A-Za-z0-9]/.test(ch);
-
-    // If the base ends with the *first letter* of a word (e.g. `"Oh, d`), force the next char to be
-    // a word-continuation character so the model completes the word instead of inserting punctuation.
-    // Allows both cases (lowercase + uppercase) to support ALL-CAPS dialogue / emphasis in roleplay.
-    if (isAsciiLetter(last) && /[\s"'""''(\[{<,.;:!?-]/.test(prev)) {
-        return "(?:[a-zA-Z\\-\\'])";
-    }
-
-    // If base ends mid-word (both prev and last are letters), force continuation with a letter,
-    // apostrophe, or hyphen so the model completes the word.  Uppercase is allowed for ALL-CAPS
-    // roleplay text (e.g. "DON'T", "PLEASE").
-    if (isAsciiLetter(last) && isAsciiLetter(prev)) {
-        return "[a-zA-Z'\\-]";
-    }
-
-    // If base ends with an alnum char (but not clearly mid-word), disallow an immediate uppercase
-    // letter as the next char.  The model can still start a new sentence by emitting whitespace first.
-    if (isAsciiAlphaNum(last) && isAsciiUpper(last) === false) {
-        return '[^A-Z]';
-    }
-
+function buildContinueJoinPlaceholder() {
+    // The overlap is always the LAST N chars of the base text, so its end equals
+    // the natural end of the message — never cut mid-word at the join point.
+    // No constraint is needed; the model naturally continues from the overlap.
     return '';
 }
 
@@ -2005,10 +1977,11 @@ function onChatCompletionSettingsReady(generateData) {
 
         buildContinueStripper(baseText);
 
-        const overlap = computeContinueOverlapBase(baseText, 14);
+        const overlapChars = clampInt(settings.continue_overlap_chars, 0, 120, 14);
+        const overlap = computeContinueOverlapBase(baseText, overlapChars);
         runtimeState.continue.overlapText = overlap;
         buildContinueOverlapStripper(overlap);
-        joinSuffixRegex = buildContinueJoinPlaceholder(baseText);
+        joinSuffixRegex = buildContinueJoinPlaceholder();
 
         if (pmPrefix) {
             buildContinuePmStripper(pmPrefix);
@@ -2167,6 +2140,7 @@ function renderSettingsToUi() {
     $('#structuredprefill_hide_prefill_in_display').prop('checked', !!settings.hide_prefill_in_display);
     $('#structuredprefill_min_chars_after_prefix').val(String(settings.min_chars_after_prefix ?? 80));
     $('#structuredprefill_newline_token').val(String(settings.newline_token ?? '<NL>'));
+    $('#structuredprefill_continue_overlap_chars').val(String(settings.continue_overlap_chars ?? 14));
 }
 
 function setupUiListeners() {
@@ -2196,6 +2170,14 @@ function setupUiListeners() {
         .off('input')
         .on('input', () => {
             extension_settings[extensionName].newline_token = String($('#structuredprefill_newline_token').val() ?? '<NL>');
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_continue_overlap_chars')
+        .off('change')
+        .on('change', () => {
+            extension_settings[extensionName].continue_overlap_chars = clampInt($('#structuredprefill_continue_overlap_chars').val(), 0, 120, 14);
+            $('#structuredprefill_continue_overlap_chars').val(String(extension_settings[extensionName].continue_overlap_chars));
             saveSettingsDebounced();
         });
 }

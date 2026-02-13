@@ -1,6 +1,5 @@
 https://rentry.org/structuredprefill
 
-
 ## TLDR?
 1) install the extension  
 2) add an **assistant-role** message at the very bottom (your prefill)  

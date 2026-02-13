@@ -1909,8 +1909,23 @@ function onChatCompletionSettingsReady(generateData) {
     const tail = tailIndex >= 0 ? messages[tailIndex] : null;
 
     if (!tail || tail.role !== 'assistant' || typeof tail.content !== 'string') return;
-    const tailContent = tail.content;
+    let tailContent = tail.content;
     if (!tailContent) return;
+
+    // When ST's "Character Names Behavior" is set to "Message Content", all message contents
+    // in the messages array get "CharName: " prepended (openai.js setOpenAIMessages).
+    // Strip it: baseText (from chat[].mes) never has the prefix, so leaving it causes mismatches
+    // in Continue logic and leaks the name into the schema pattern.
+    {
+        const names = (runtimeState.knownNames ?? []).slice().sort((a, b) => b.length - a.length);
+        for (const name of names) {
+            if (name && tailContent.startsWith(name + ': ')) {
+                tailContent = tailContent.slice(name.length + 2);
+                tail.content = tailContent;
+                break;
+            }
+        }
+    }
 
     resetStreamGuard();
     clearHidePrefillState();

@@ -15,6 +15,8 @@ const defaultSettings = {
     min_chars_after_prefix: 80,
     // Number of characters from the end of the existing message used as overlap for Continue.
     continue_overlap_chars: 14,
+    // Anti-Slop: newline-separated list of banned words/phrases.
+    anti_slop_ban_list: '',
 };
 
 const runtimeState = {
@@ -948,6 +950,95 @@ function getPatternModeForRequest(source, modelId) {
     return 'default';
 }
 
+/**
+ * Build a DFA-complement regex from the anti-slop ban list.
+ * Returns a regex group that matches one "step" (1+ chars) without completing
+ * any banned word, or null if the list is empty / unsupported.
+ * Usage: replace `(?:.|\\n)` with the returned group in the continuation.
+ *
+ * Approach: build a trie of banned words, then convert it to a complement regex.
+ * Each iteration of the outer group consumes 1+ chars without completing any banned word.
+ * E.g. banning "gaze" → ([^gG]|[gG]([^aA]|[aA]([^zZ]|[zZ][^eE])))
+ */
+function buildAntiSlopContinuation(banListStr) {
+    const raw = String(banListStr ?? '');
+    if (!raw.trim()) return null;
+
+    const seen = new Set();
+    const words = [];
+    for (const line of raw.split('\n')) {
+        const entry = line.trim();
+        if (!entry || seen.has(entry.toLowerCase())) continue;
+        seen.add(entry.toLowerCase());
+        words.push(entry);
+    }
+    if (words.length === 0) return null;
+
+    // Build trie (keyed by lowercase)
+    const mkNode = () => ({ ch: new Map(), end: false });
+    const root = mkNode();
+    for (const word of words) {
+        let node = root;
+        for (const c of word) {
+            const k = c.toLowerCase();
+            if (!node.ch.has(k)) node.ch.set(k, mkNode());
+            node = node.ch.get(k);
+        }
+        node.end = true;
+    }
+
+    const escClass = (c) => (c === ']' || c === '\\' || c === '^' || c === '-') ? '\\' + c : c;
+
+    // Recursively convert a trie node to a complement regex group.
+    // The returned group matches one "safe step" from this node's perspective.
+    function toRegex(node) {
+        if (node.ch.size === 0) return null; // leaf — no further constraints
+
+        const excludes = []; // chars to exclude in the safe catch-all class
+        const branches = []; // branches for chars that start a potential match
+
+        for (const [key, child] of node.ch) {
+            const lo = key.toLowerCase();
+            const up = key.toUpperCase();
+            const hasCase = lo !== up;
+            excludes.push(escClass(lo));
+            if (hasCase) excludes.push(escClass(up));
+
+            if (child.end) {
+                // This char completes a banned word — blocked by the exclude class.
+                // Even if the child has further children (longer words sharing this prefix),
+                // the shorter banned word already blocks this path.
+                continue;
+            }
+
+            // Not end — recurse deeper
+            const charExpr = hasCase ? `[${up}${lo}]` : escClass(key);
+            const sub = toRegex(child);
+            if (sub) {
+                branches.push(`${charExpr}${sub}`);
+            } else {
+                // Child is a leaf but not end — shouldn't happen, but treat as safe
+                branches.push(charExpr);
+            }
+        }
+
+        const safeClass = `[^${excludes.join('')}]`;
+        const parts = [safeClass, ...branches];
+        return `(${parts.join('|')})`;
+    }
+
+    const expr = toRegex(root);
+    if (!expr) return null;
+
+    try {
+        new RegExp(expr);
+    } catch {
+        console.warn(`[${extensionName}] Anti-slop pattern failed validation, skipping.`);
+        return null;
+    }
+    return expr;
+}
+
 function splitHintSuffix(placeholderBody) {
     const body = String(placeholderBody ?? '');
     const idx = body.toLowerCase().lastIndexOf('|hint:');
@@ -1250,7 +1341,9 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
     // but do not enforce `min_chars_after_prefix` with a `{n,}` range.
     // Use `${anyChar}+` for simplicity; the stream guard already protects against pathological padding.
     const minMinusOne = Math.max(0, minChars - 1);
-    const anyChar = anyCharIncludingNewlineExpr();
+    const defaultAnyChar = anyCharIncludingNewlineExpr();
+    const antiSlopExpr = buildAntiSlopContinuation(extension_settings[extensionName]?.anti_slop_ban_list);
+    const anyChar = antiSlopExpr || defaultAnyChar;
     let pattern = '';
     if (runtimeState.patternMode === 'anthropic') {
         pattern = `^(?:${prefixRegex})${anyChar}+$`;
@@ -2170,6 +2263,7 @@ function renderSettingsToUi() {
     $('#structuredprefill_min_chars_after_prefix').val(String(settings.min_chars_after_prefix ?? 80));
     $('#structuredprefill_newline_token').val(String(settings.newline_token ?? '<NL>'));
     $('#structuredprefill_continue_overlap_chars').val(String(settings.continue_overlap_chars ?? 14));
+    $('#structuredprefill_anti_slop_ban_list').val(String(settings.anti_slop_ban_list ?? ''));
 }
 
 function setupUiListeners() {
@@ -2207,6 +2301,13 @@ function setupUiListeners() {
         .on('change', () => {
             extension_settings[extensionName].continue_overlap_chars = clampInt($('#structuredprefill_continue_overlap_chars').val(), 0, 120, 14);
             $('#structuredprefill_continue_overlap_chars').val(String(extension_settings[extensionName].continue_overlap_chars));
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_anti_slop_ban_list')
+        .off('input')
+        .on('input', () => {
+            extension_settings[extensionName].anti_slop_ban_list = String($('#structuredprefill_anti_slop_ban_list').val() ?? '');
             saveSettingsDebounced();
         });
 }

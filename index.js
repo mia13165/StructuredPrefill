@@ -10,7 +10,7 @@ const extensionPath = 'third-party/StructuredPrefill';
 const defaultSettings = {
     enabled: true,
     hide_prefill_in_display: true,
-    newline_token: '<NL>',
+    newline_token: '\\n',
     // Require some actual continuation beyond the prefix (in chars).
     min_chars_after_prefix: 80,
     // Number of characters from the end of the existing message used as overlap for Continue.
@@ -56,6 +56,7 @@ const runtimeState = {
     stopCleanupTimer: null,
     stopping: false,
     stopSessionAt: 0,
+    trackedSwipeId: -1,
     applyingDom: 0,
     postFrameQueued: false,
     userScrollLocked: false,
@@ -1667,6 +1668,18 @@ function applyTextToMessage(messageId, newText, { forceRerender = false } = {}) 
     const message = chat[messageId];
     if (!message || message.is_user) return;
     if (typeof newText !== 'string') return;
+
+    // If the user swiped/reverted during generation, do not apply decoded text to the wrong swipe.
+    if (runtimeState.trackedSwipeId !== -1 && typeof message.swipe_id === 'number' && message.swipe_id !== runtimeState.trackedSwipeId) {
+        console.debug(`[${extensionName}] Skipping applyTextToMessage for message ${messageId} due to swipe_id mismatch (${runtimeState.trackedSwipeId} != ${message.swipe_id})`);
+        return;
+    }
+
+    // Don't replace meaningful content with empty strings (e.g., on early abort)
+    if (newText.trim().length === 0 && message.mes && message.mes.trim().length > 0) {
+        console.debug(`[${extensionName}] Skipping empty text application to message ${messageId} (has existing content)`);
+        return;
+    }
     if (!forceRerender && message.mes === newText) return;
 
     // Apply user regex scripts (global + preset) to the decoded AI output.
@@ -1698,7 +1711,9 @@ function applyTextToMessage(messageId, newText, { forceRerender = false } = {}) 
     // message.extra.structuredprefill.prefixTemplate if ever needed.
     const settings = extension_settings[extensionName];
     const prefillWasStripped = settings?.hide_prefill_in_display && displayText !== textAfterRegex;
-    const mesText = prefillWasStripped ? displayText : textAfterRegex;
+    // If an early-aborted response only contains the prefix, stripping would make it look like the message vanished.
+    // In that case, keep the full decoded text visible instead of replacing it with empty.
+    const mesText = (prefillWasStripped && displayText.trim().length === 0) ? textAfterRegex : (prefillWasStripped ? displayText : textAfterRegex);
 
     message.mes = mesText;
     if (displayText !== mesText) {
@@ -1750,6 +1765,20 @@ function applyTextToMessageStreaming(messageId, newText) {
     if (!message || message.is_user) return;
     if (typeof newText !== 'string') return;
 
+    // Lock onto the swipe we're generating into as soon as we can.
+    if (runtimeState.trackedSwipeId === -1 && typeof message.swipe_id === 'number') {
+        runtimeState.trackedSwipeId = message.swipe_id;
+    }
+    // If the swipe changed (user swipe/revert), do not overwrite a different swipe's content.
+    if (runtimeState.trackedSwipeId !== -1 && typeof message.swipe_id === 'number' && message.swipe_id !== runtimeState.trackedSwipeId) {
+        return;
+    }
+
+    // Don't replace meaningful content with empty strings (e.g., on very early abort)
+    if (newText.trim().length === 0 && typeof message.mes === 'string' && message.mes.trim().length > 0) {
+        return;
+    }
+
     ensureScrollIntentListeners();
 
     const displayText = computeDisplayText(messageId, newText);
@@ -1766,7 +1795,7 @@ function applyTextToMessageStreaming(messageId, newText) {
     } else if (Object.prototype.hasOwnProperty.call(message.extra, 'display_text')) {
         delete message.extra.display_text;
     }
-    if (Array.isArray(message.swipes)) {
+    if (Array.isArray(message.swipes) && typeof message.swipe_id === 'number') {
         message.swipes[message.swipe_id] = newText;
     }
 
@@ -1925,22 +1954,55 @@ function touchStopCleanup(messageId, sessionAtStop) {
 
     clearStopCleanupTimer();
     runtimeState.stopCleanupTimer = setTimeout(() => {
-        // If a new generation started, don’t interfere.
+        // If a new generation started, don't interfere.
         if (!runtimeState.active) return;
         if (runtimeState.stopSessionAt !== sessionAtStop) return;
+
+        // Validate message still exists and hasn't been deleted/reverted
+        const message = chat?.[messageId];
+        if (!message || message.is_user) {
+            console.debug(`[${extensionName}] Stop cleanup: message ${messageId} no longer valid, skipping`);
+            runtimeState.active = false;
+            runtimeState.stopping = false;
+            runtimeState.trackedSwipeId = -1;
+            disconnectStreamObserver();
+            clearStopCleanupTimer();
+            clearHidePrefillState();
+            clearContinueState();
+            resetStreamGuard();
+            return;
+        }
+
+        // If swipe_id has changed (user swiped or ST reverted), don't apply to wrong swipe
+        if (runtimeState.trackedSwipeId !== -1 && message.swipe_id !== runtimeState.trackedSwipeId) {
+            console.debug(`[${extensionName}] Stop cleanup: swipe_id changed (${runtimeState.trackedSwipeId} → ${message.swipe_id}), skipping`);
+            runtimeState.active = false;
+            runtimeState.stopping = false;
+            runtimeState.trackedSwipeId = -1;
+            disconnectStreamObserver();
+            clearStopCleanupTimer();
+            clearHidePrefillState();
+            clearContinueState();
+            resetStreamGuard();
+            return;
+        }
 
         // Final best-effort render so markdown etc. is correct in the saved message.
         const raw = getRawCandidateForMessage(messageId);
         const unwrapped = tryUnwrapStructuredOutput(String(raw));
-        if (typeof unwrapped === 'string') {
-            runtimeState.lastAppliedText = unwrapped;
-            applyTextToMessage(messageId, unwrapped, { forceRerender: true });
-        } else if (typeof runtimeState.lastAppliedText === 'string') {
-            applyTextToMessage(messageId, runtimeState.lastAppliedText, { forceRerender: true });
+
+        // Only apply if we have meaningful content (prevent applying empty strings on early abort)
+        const textToApply = typeof unwrapped === 'string' ? unwrapped : runtimeState.lastAppliedText;
+        if (typeof textToApply === 'string' && textToApply.trim().length > 0) {
+            runtimeState.lastAppliedText = textToApply;
+            applyTextToMessage(messageId, textToApply, { forceRerender: true });
+        } else {
+            console.debug(`[${extensionName}] Stop cleanup: no valid text to apply, skipping render`);
         }
 
         runtimeState.active = false;
         runtimeState.stopping = false;
+        runtimeState.trackedSwipeId = -1;
         disconnectStreamObserver();
         clearStopCleanupTimer();
         clearHidePrefillState();
@@ -2024,6 +2086,9 @@ function onChatCompletionSettingsReady(generateData) {
     resetStreamGuard();
     clearHidePrefillState();
     clearContinueState();
+
+    // Reset per-generation targeting so we don't apply to an unrelated swipe.
+    runtimeState.trackedSwipeId = -1;
 
     // Build schema + state differently for Continue vs normal generations.
     // - Normal: remove assistant prefill and enforce it via schema.
@@ -2198,6 +2263,22 @@ function onChatCompletionSettingsReady(generateData) {
     // Store the straight-quoted version: curly quotes only exist for JSON wire robustness,
     // but the decoded output is always straightened, so metadata/stripping must match straight quotes.
     runtimeState.expectedPrefill = straightenCurlyQuotes(String(schemaPrefix ?? ''));
+
+    // If this generation updates an existing assistant message (e.g., swipes), seed the fallback with the
+    // currently displayed content so early-abort / early-token cases don't blank the message.
+    try {
+        const tailChatMessage = chat?.[chat.length - 1];
+        if (tailChatMessage && !tailChatMessage.is_user && !tailChatMessage.is_system) {
+            if (typeof tailChatMessage.swipe_id === 'number') {
+                runtimeState.trackedSwipeId = tailChatMessage.swipe_id;
+            }
+            if (typeof tailChatMessage.mes === 'string' && tailChatMessage.mes.trim().length > 0) {
+                runtimeState.lastAppliedText = tailChatMessage.mes;
+            }
+        }
+    } catch {
+        // ignore
+    }
 }
 
 function scheduleStreamUnwrap(rawText) {
@@ -2236,6 +2317,7 @@ function onMessageReceived(messageId) {
 
     runtimeState.active = false;
     runtimeState.stopping = false;
+    runtimeState.trackedSwipeId = -1;
     clearStopCleanupTimer();
     disconnectStreamObserver();
     clearHidePrefillState();
@@ -2249,6 +2331,13 @@ function onGenerationStopped() {
     const messageId = getActiveAssistantMessageIdForStreaming();
     runtimeState.stopping = true;
     runtimeState.stopSessionAt = runtimeState.lastInjectedAt;
+
+    // Track the current swipe_id to validate it hasn't changed when cleanup fires.
+    // If it was already captured at injection time (e.g., swipe generation), don't overwrite it.
+    if (runtimeState.trackedSwipeId === -1) {
+        const message = chat?.[messageId];
+        runtimeState.trackedSwipeId = message?.swipe_id ?? -1;
+    }
 
     ensureStreamObserver(messageId);
     // Decode immediately and then keep decoding until the DOM goes quiet.

@@ -6,7 +6,7 @@
     "js": "index.js",
     "css": "styles.css",
     "author": "",
-    "version": "0.0.2",
+    "version": "0.0.3",
     "homePage": "https://rentry.org/structuredprefill",
     "description": "Prefill-like behavior using Structured Outputs (json_schema) instead of assistant-role prefills.",
     "auto_update": false

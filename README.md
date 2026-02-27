@@ -6,6 +6,24 @@ https://rentry.org/structuredprefill
 3) send a message like normal  
 4) StructuredPrefill auto-activates (when supported) and the reply is forced to begin with your prefill
 
+## Prefill Generator (`[[pg]]`)
+If your prefill template contains `[[pg]]`, StructuredPrefill can first call a separate "prefill generator" LLM and splice its output into the prefill template.
+
+- The prefill generator sees the full chat context **minus** the trailing assistant prefill message.
+- The prefill generator does **not** run on Continue.
+- If prefill generator fails, `[[pg]]` becomes an empty string, a toast error is shown, and generation proceeds normally.
+
+### Recommended usage with `[[keep]]`
+If you enable "Hide prefill text in the final message", you can hide everything before `[[keep]]` while still forcing the model to start with it.
+For the cleanest experience, end your prefill with:
+
+```text
+... [[keep]]
+[[pg]]
+```
+
+This makes only the generated prefill tail visible/saved (everything before `[[keep]]` is hidden/stripped).
+
 ## USECASE?
 Models like Opus 4.6 and many more to come are REMOVING prefill. We can NOT have this, and so we have to find an alternate way to get the prefill functionality back in a way that may even be better than regular prefilling.
 

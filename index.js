@@ -1,4 +1,4 @@
-import { chat, messageFormatting, saveSettingsDebounced, scrollChatToBottom, updateMessageBlock } from '../../../../script.js';
+import { chat, getRequestHeaders, messageFormatting, saveSettingsDebounced, scrollChatToBottom, updateMessageBlock } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { getRegexedString, regex_placement } from '../../regex/engine.js';
 
@@ -17,6 +17,14 @@ const defaultSettings = {
     continue_overlap_chars: 14,
     // Anti-Slop: newline-separated list of banned words/phrases.
     anti_slop_ban_list: '',
+
+    // Prefill Generator: if the prefill template contains `[[pg]]`, we run a separate (non-streaming) generation
+    // using a different connection profile and splice the output into the template before injecting json_schema.
+    prefill_gen_enabled: false,
+    prefill_gen_profile_id: '',
+    prefill_gen_max_tokens: 15,
+    prefill_gen_stop: '',
+    prefill_gen_timeout_ms: 12000,
 };
 
 const runtimeState = {
@@ -167,6 +175,152 @@ function clampInt(value, min, max, fallback) {
     if (!Number.isFinite(num)) return fallback;
     const int = Math.trunc(num);
     return Math.min(max, Math.max(min, int));
+}
+
+function parseStopStrings(raw) {
+    const s = String(raw ?? '');
+    const lines = s.split(/\r?\n/g).map(x => String(x ?? '').trim()).filter(Boolean);
+    return lines;
+}
+
+function getConnectionProfilesSafe() {
+    const profiles = extension_settings?.connectionManager?.profiles;
+    return Array.isArray(profiles) ? profiles : [];
+}
+
+function renderPrefillGenProfileSelect() {
+    const select = document.getElementById('structuredprefill_prefill_gen_profile');
+    if (!(select instanceof HTMLSelectElement)) return;
+
+    const current = String(extension_settings?.[extensionName]?.prefill_gen_profile_id ?? '');
+    const profiles = getConnectionProfilesSafe()
+        .filter(p => p && typeof p === 'object')
+        .filter(p => String(p.mode ?? '').toLowerCase() === 'cc')
+        .slice()
+        .sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? '')));
+
+    select.innerHTML = '';
+
+    const none = document.createElement('option');
+    none.value = '';
+    none.textContent = '<None>';
+    select.appendChild(none);
+
+    for (const p of profiles) {
+        const opt = document.createElement('option');
+        opt.value = String(p.id ?? '');
+        opt.textContent = String(p.name ?? p.id ?? 'Profile');
+        select.appendChild(opt);
+    }
+
+    // Best-effort: restore selection.
+    select.value = current;
+    if (select.value !== current) {
+        select.value = '';
+    }
+}
+
+function templateHasPrefillGenSlot(template) {
+    return /\[\[\s*pg\s*\]\]/i.test(String(template ?? ''));
+}
+
+function extractPlainTextFromCompletionResponse(data) {
+    const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        // Some sources use array-of-parts formats; keep only text-ish parts.
+        return content.map(x => (typeof x === 'string' ? x : (x?.text ?? ''))).filter(Boolean).join('');
+    }
+    return '';
+}
+
+async function runPrefillGeneratorOrEmpty({ generateData, tailIndex, timeoutMs, maxTokens, stopStrings, profileId }) {
+    const profiles = getConnectionProfilesSafe();
+    const profile = profiles.find(p => String(p?.id ?? '') === String(profileId ?? '')) ?? null;
+    if (!profile) {
+        throw new Error('Prefill generator: connection profile not found');
+    }
+    if (String(profile.mode ?? '').toLowerCase() !== 'cc') {
+        throw new Error('Prefill generator: selected profile is not a Chat Completion profile');
+    }
+
+    const source = String(profile.api ?? '').trim().toLowerCase();
+    const model = String(profile.model ?? '').trim();
+    if (!source) {
+        throw new Error('Prefill generator: profile has no API (api) value');
+    }
+    if (!model) {
+        throw new Error('Prefill generator: profile has no model value');
+    }
+
+    // Full chat context minus the trailing assistant prefill template.
+    const baseMessages = Array.isArray(generateData?.messages)
+        ? generateData.messages.filter((_, i) => i !== tailIndex).map(m => ({ ...m }))
+        : [];
+
+    if (!baseMessages.length) {
+        throw new Error('Prefill generator: no messages to generate from');
+    }
+
+    // Some routed providers reject assistant-role final messages. Ensure last role is not assistant.
+    const last = baseMessages[baseMessages.length - 1];
+    if (last?.role === 'assistant') {
+        baseMessages[baseMessages.length - 1] = { ...last, role: 'user' };
+    }
+
+    const payload = {
+        type: 'quiet',
+        messages: baseMessages,
+        model: model,
+        temperature: 1,
+        top_p: 1,
+        max_tokens: maxTokens,
+        stream: false,
+        stop: (Array.isArray(stopStrings) && stopStrings.length) ? stopStrings : undefined,
+        chat_completion_source: source,
+        user_name: generateData?.user_name,
+        char_name: generateData?.char_name,
+        group_names: generateData?.group_names,
+        include_reasoning: false,
+        enable_web_search: false,
+        request_images: false,
+    };
+
+    // Custom OpenAI-compatible requires an explicit URL.
+    if (source === 'custom') {
+        const url = String(profile['api-url'] ?? '').trim();
+        if (!url) {
+            throw new Error('Prefill generator: custom profile missing api-url');
+        }
+        payload.custom_url = url;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.max(500, timeoutMs));
+
+    try {
+        const res = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+        });
+
+        if (!res.ok) {
+            const text = await res.text().catch(() => '');
+            throw new Error(`Prefill generator: backend returned ${res.status} ${res.statusText}${text ? `: ${text}` : ''}`);
+        }
+
+        const data = await res.json();
+        if (data?.error) {
+            const msg = String(data?.error?.message ?? data?.message ?? 'Unknown error');
+            throw new Error(`Prefill generator: ${msg}`);
+        }
+
+        return extractPlainTextFromCompletionResponse(data);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function supportsStructuredPrefillForSource(chatCompletionSource) {
@@ -2011,7 +2165,7 @@ function touchStopCleanup(messageId, sessionAtStop) {
     }, 250);
 }
 
-function onChatCompletionSettingsReady(generateData) {
+async function onChatCompletionSettingsReady(generateData) {
     const settings = extension_settings[extensionName];
     if (!settings?.enabled) return;
     if (!generateData || typeof generateData !== 'object') return;
@@ -2182,6 +2336,41 @@ function onChatCompletionSettingsReady(generateData) {
         schemaPrefix = `${pmPrefix || ''}${overlap}`;
         runtimeState.newlineToken = chooseNewlineToken(schemaPrefix || baseText, settings.newline_token);
     } else {
+        // Prefill generator: replace any `[[pg]]` placeholders by calling a separate model/profile.
+        // If disabled (or if generation fails), replace `[[pg]]` with an empty string and proceed normally.
+        if (templateHasPrefillGenSlot(prefillTemplate)) {
+            const profileId = String(settings.prefill_gen_profile_id ?? '');
+            const maxTokens = clampInt(settings.prefill_gen_max_tokens, 1, 2048, 15);
+            const timeoutMs = clampInt(settings.prefill_gen_timeout_ms, 500, 120000, 12000);
+            const stopStrings = parseStopStrings(settings.prefill_gen_stop);
+
+            let generated = '';
+            if (settings.prefill_gen_enabled) {
+                try {
+                    generated = await runPrefillGeneratorOrEmpty({
+                        generateData,
+                        tailIndex,
+                        timeoutMs,
+                        maxTokens,
+                        stopStrings,
+                        profileId,
+                    });
+                } catch (err) {
+                    try {
+                        console.warn(`[${extensionName}] Prefill generator failed:`, err);
+                    } catch {
+                        // ignore
+                    }
+                    if (window?.toastr?.error) {
+                        window.toastr.error(String(err?.message ?? err ?? 'Prefill generator failed'), extensionName, { timeOut: 9000, closeButton: true });
+                    }
+                    generated = '';
+                }
+            }
+
+            prefillTemplate = String(prefillTemplate ?? '').replace(/\[\[\s*pg\s*\]\]/gi, String(generated ?? ''));
+        }
+
         // Remove the assistant prefill message and replace it with a structured output constraint.
         messages.splice(tailIndex, 1);
 
@@ -2350,6 +2539,11 @@ function renderSettingsToUi() {
     $('#structuredprefill_enabled').prop('checked', !!settings.enabled);
     $('#structuredprefill_hide_prefill_in_display').prop('checked', !!settings.hide_prefill_in_display);
     $('#structuredprefill_min_chars_after_prefix').val(String(settings.min_chars_after_prefix ?? 80));
+    $('#structuredprefill_prefill_gen_enabled').prop('checked', !!settings.prefill_gen_enabled);
+    $('#structuredprefill_prefill_gen_max_tokens').val(String(settings.prefill_gen_max_tokens ?? 15));
+    $('#structuredprefill_prefill_gen_stop').val(String(settings.prefill_gen_stop ?? ''));
+    $('#structuredprefill_prefill_gen_timeout_ms').val(String(settings.prefill_gen_timeout_ms ?? 12000));
+    renderPrefillGenProfileSelect();
     $('#structuredprefill_newline_token').val(String(settings.newline_token ?? '<NL>'));
     $('#structuredprefill_continue_overlap_chars').val(String(settings.continue_overlap_chars ?? 14));
     $('#structuredprefill_anti_slop_ban_list').val(String(settings.anti_slop_ban_list ?? ''));
@@ -2375,6 +2569,43 @@ function setupUiListeners() {
         .on('change', () => {
             extension_settings[extensionName].min_chars_after_prefix = clampInt($('#structuredprefill_min_chars_after_prefix').val(), 1, 10000, 80);
             $('#structuredprefill_min_chars_after_prefix').val(String(extension_settings[extensionName].min_chars_after_prefix));
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_prefill_gen_enabled')
+        .off('click')
+        .on('click', () => {
+            extension_settings[extensionName].prefill_gen_enabled = !!$('#structuredprefill_prefill_gen_enabled').prop('checked');
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_prefill_gen_profile')
+        .off('change')
+        .on('change', () => {
+            extension_settings[extensionName].prefill_gen_profile_id = String($('#structuredprefill_prefill_gen_profile').val() ?? '');
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_prefill_gen_max_tokens')
+        .off('change')
+        .on('change', () => {
+            extension_settings[extensionName].prefill_gen_max_tokens = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 2048, 15);
+            $('#structuredprefill_prefill_gen_max_tokens').val(String(extension_settings[extensionName].prefill_gen_max_tokens));
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_prefill_gen_stop')
+        .off('input')
+        .on('input', () => {
+            extension_settings[extensionName].prefill_gen_stop = String($('#structuredprefill_prefill_gen_stop').val() ?? '');
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_prefill_gen_timeout_ms')
+        .off('change')
+        .on('change', () => {
+            extension_settings[extensionName].prefill_gen_timeout_ms = clampInt($('#structuredprefill_prefill_gen_timeout_ms').val(), 500, 120000, 12000);
+            $('#structuredprefill_prefill_gen_timeout_ms').val(String(extension_settings[extensionName].prefill_gen_timeout_ms));
             saveSettingsDebounced();
         });
 
@@ -2412,6 +2643,10 @@ jQuery(async () => {
     ensureScrollIntentListeners();
 
     eventSource.on(event_types.CHAT_COMPLETION_SETTINGS_READY, onChatCompletionSettingsReady);
+    eventSource.on(event_types.CONNECTION_PROFILE_LOADED, renderPrefillGenProfileSelect);
+    eventSource.on(event_types.CONNECTION_PROFILE_CREATED, renderPrefillGenProfileSelect);
+    eventSource.on(event_types.CONNECTION_PROFILE_UPDATED, renderPrefillGenProfileSelect);
+    eventSource.on(event_types.CONNECTION_PROFILE_DELETED, renderPrefillGenProfileSelect);
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, scheduleStreamUnwrap);
     eventSource.on(event_types.MESSAGE_UPDATED, onMessageUpdated);
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);

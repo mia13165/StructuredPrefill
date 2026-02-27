@@ -7,6 +7,15 @@
 
         <div class="inline-drawer-content">
             <div class="structuredprefill-settings-group">
+                <strong class="structuredprefill-center-text">Help</strong>
+                <div class="flex-container flexFlowColumn">
+                    <small>
+                        Docs: <a href="https://rentry.org/structuredprefill" target="_blank" rel="noopener noreferrer">rentry.org/structuredprefill</a>
+                    </small>
+                </div>
+            </div>
+
+            <div class="structuredprefill-settings-group">
                 <strong class="structuredprefill-center-text">General</strong>
                 <div class="flex-container">
                     <label class="flex-container">
@@ -18,34 +27,78 @@
                 <div class="flex-container">
                     <label class="flex-container">
                         <input type="checkbox" id="structuredprefill_hide_prefill_in_display">
-                        <small>Hide the prefill text in the final message</small>
+                        <small>Hide prefill text in the final message (use <code>[[keep]]</code> to keep only the tail visible)</small>
                     </label>
                 </div>
             </div>
 
             <div class="structuredprefill-settings-group">
-                <strong class="structuredprefill-center-text">Advanced</strong>
+                <strong class="structuredprefill-center-text">Schema</strong>
                 <div class="flex-container flexFlowColumn">
                     <label for="structuredprefill_min_chars_after_prefix">Minimum characters after prefix</label>
                     <input id="structuredprefill_min_chars_after_prefix" class="text_pole" type="number" min="1" max="10000" step="1" autocomplete="off">
+                    <small>Normal generations only. Continue uses its own minimal constraint.</small>
                 </div>
 
                 <div class="flex-container flexFlowColumn">
                     <label for="structuredprefill_newline_token">Newline token (encoded in schema)</label>
-                    <input id="structuredprefill_newline_token" class="text_pole" type="text" autocomplete="off" placeholder="&lt;NL&gt;">
-                </div>
-
-                <div class="flex-container flexFlowColumn">
-                    <label for="structuredprefill_continue_overlap_chars">Overlap # of characters for Continue</label>
-                    <input id="structuredprefill_continue_overlap_chars" class="text_pole" type="number" min="0" max="120" step="1" autocomplete="off">
-                </div>
-
-                <div class="flex-container flexFlowColumn">
-                    <label for="structuredprefill_anti_slop_ban_list">Anti-Slop — Banned words (one per line)</label>
-                    <textarea id="structuredprefill_anti_slop_ban_list" class="text_pole" rows="6" placeholder="ozone&#10;Elara&#10;—" autocomplete="off"></textarea>
+                    <input id="structuredprefill_newline_token" class="text_pole" type="text" autocomplete="off" placeholder="\n">
                 </div>
             </div>
 
+            <div class="structuredprefill-settings-group">
+                <strong class="structuredprefill-center-text">Prefill Generator (<code>[[pg]]</code>)</strong>
+                <div class="flex-container">
+                    <label class="flex-container">
+                        <input type="checkbox" id="structuredprefill_prefill_gen_enabled">
+                        <small>Replace <code>[[pg]]</code> using a separate LLM call (non-streaming)</small>
+                    </label>
+                </div>
+
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_prefill_gen_profile">Connection profile</label>
+                    <select id="structuredprefill_prefill_gen_profile" class="text_pole"></select>
+                    <small>Uses the profile's API/model for prefill-gen only (does not switch your main chat API).</small>
+                </div>
+
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_prefill_gen_max_tokens">Max tokens</label>
+                    <input id="structuredprefill_prefill_gen_max_tokens" class="text_pole" type="number" min="1" max="2048" step="1" autocomplete="off">
+                </div>
+
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_prefill_gen_stop">Stop strings (one per line)</label>
+                    <textarea id="structuredprefill_prefill_gen_stop" class="text_pole" rows="4" placeholder="\n" autocomplete="off"></textarea>
+                </div>
+
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_prefill_gen_timeout_ms">Timeout (ms)</label>
+                    <input id="structuredprefill_prefill_gen_timeout_ms" class="text_pole" type="number" min="500" max="120000" step="100" autocomplete="off">
+                </div>
+
+                <small>
+                    Tip: for best UX, end your prefill with:
+                    <br><code>[[keep]]</code>
+                    <br><code>[[pg]]</code>
+                </small>
+            </div>
+
+            <div class="structuredprefill-settings-group">
+                <strong class="structuredprefill-center-text">Continue</strong>
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_continue_overlap_chars">Overlap characters</label>
+                    <input id="structuredprefill_continue_overlap_chars" class="text_pole" type="number" min="0" max="120" step="1" autocomplete="off">
+                </div>
+                <small><code>[[pg]]</code> is not used for Continue.</small>
+            </div>
+
+            <div class="structuredprefill-settings-group">
+                <strong class="structuredprefill-center-text">Anti-Slop</strong>
+                <div class="flex-container flexFlowColumn">
+                    <label for="structuredprefill_anti_slop_ban_list">Banned words (one per line)</label>
+                    <textarea id="structuredprefill_anti_slop_ban_list" class="text_pole" rows="6" placeholder="ozone&#10;Elara&#10;—" autocomplete="off"></textarea>
+                </div>
+            </div>
         </div>
     </div>
 </div>

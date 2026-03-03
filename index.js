@@ -548,6 +548,25 @@ function splitHidePrefillTemplate(prefixTemplate) {
     };
 }
 
+function splitEndPrefillTemplate(prefixTemplate) {
+    const normalized = normalizeNewlines(prefixTemplate);
+    if (!normalized) return { template: '', hasEndMarker: false };
+
+    // When `[[end]]` is present, it acts as a directive to force the model's response to end
+    // exactly at that point (no continuation after the template).
+    //
+    // Everything after the marker is ignored for schema/stripping purposes. This lets users
+    // keep comments/notes after `[[end]]` without affecting the enforced output.
+    const markerRe = /\[\[\s*(end|stop|eos)\s*\]\]/i;
+    const m = markerRe.exec(normalized);
+    if (!m) return { template: normalized, hasEndMarker: false };
+
+    return {
+        template: normalized.slice(0, m.index),
+        hasEndMarker: true,
+    };
+}
+
 function buildPrefillStripper(prefixTemplate) {
     const { hideTemplate } = splitHidePrefillTemplate(prefixTemplate);
     if (!hideTemplate) return;
@@ -1315,6 +1334,12 @@ function buildPlaceholderRegex(placeholderBody) {
         return '(?:)';
     }
 
+    // [[end]] / [[stop]] / [[eos]]: directive marker (not output) used to force the response to end
+    // at this point when building the schema pattern. Here it matches empty in the prefix template.
+    if (/^(end|stop|eos)\s*$/i.test(body)) {
+        return '(?:)';
+    }
+
     // [[emotion]] / [[mood]]: common RP emotion word.
     if (/^(emotion|mood)\s*$/i.test(body)) {
         const emotions = [
@@ -1448,8 +1473,9 @@ function buildPrefixRegexFromWireTemplate(wireTemplate) {
     return out;
 }
 
-function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, joinSuffixRegex = '') {
-    const minChars = clampInt(minCharsAfterPrefix, 1, 10000, 1);
+function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, joinSuffixRegex = '', opts = {}) {
+    const mustEndAfterTemplate = !!opts?.mustEndAfterTemplate;
+    const minChars = mustEndAfterTemplate ? 0 : clampInt(minCharsAfterPrefix, 1, 10000, 1);
     const newlineToken = runtimeState.newlineToken || '<NL>';
     const wirePrefix = encodeNewlines(prefix, newlineToken);
 
@@ -1500,7 +1526,21 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
     const antiSlopExpr = buildAntiSlopContinuation(extension_settings[extensionName]?.anti_slop_ban_list);
     const anyChar = antiSlopExpr || defaultAnyChar;
     let pattern = '';
-    if (runtimeState.patternMode === 'anthropic') {
+    if (mustEndAfterTemplate) {
+        // Allow a small amount of trailing whitespace/newlines for robustness (models sometimes emit a final newline).
+        // IMPORTANT: avoid `\s` for Anthropic compatibility; keep ASCII.
+        let trailing = `[\\t \\r\\n]*`;
+        if (newlineToken) {
+            // Some providers emit the newline token literally instead of real `\n`.
+            // Anthropic rejects non-ASCII patterns, so only include literal token if ASCII.
+            const tokenIsAscii = /^[\x00-\x7F]*$/.test(String(newlineToken));
+            if (tokenIsAscii) {
+                const escapedToken = escapeRegExp(newlineToken);
+                trailing = `[\\t ]*(?:${escapedToken}|\\n)?(?:[\\t ]*(?:${escapedToken}|\\n)[\\t ]*)*`;
+            }
+        }
+        pattern = `^(?:${prefixRegex})${trailing}$`;
+    } else if (runtimeState.patternMode === 'anthropic') {
         pattern = `^(?:${prefixRegex})${anyChar}+$`;
     } else {
         // Avoid `\S` / `[\s\S]` because some providers reject `\S` in schema patterns.
@@ -1519,21 +1559,29 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
         new RegExp(pattern);
     } catch (err) {
         console.warn(`[${extensionName}] Invalid injected regex pattern; falling back to a minimal-safe pattern.`, err);
-        pattern = runtimeState.patternMode === 'anthropic'
-            ? `^(?:${prefixRegex})${anyChar}+$`
-            : `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
+        if (mustEndAfterTemplate) {
+            pattern = `^(?:${prefixRegex})[\\t \\r\\n]*$`;
+        } else {
+            pattern = runtimeState.patternMode === 'anthropic'
+                ? `^(?:${prefixRegex})${anyChar}+$`
+                : `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
+        }
     }
 
     return {
         name: 'structured_prefill',
-        description: 'Constrain output so it begins with a prefix (prefill-like) and continues with additional content.',
+        description: mustEndAfterTemplate
+            ? 'Constrain output so it matches the prefix template exactly (no extra continuation).'
+            : 'Constrain output so it begins with a prefix (prefill-like) and continues with additional content.',
         strict: true,
         value: {
             type: 'object',
             properties: {
                 value: {
                     type: 'string',
-                    description: 'Full assistant reply text. Must start with the required prefix template (with any [[...]] slots filled) and then continue.',
+                    description: mustEndAfterTemplate
+                        ? 'Full assistant reply text. Must match the required prefix template (with any [[...]] slots filled) and then end.'
+                        : 'Full assistant reply text. Must start with the required prefix template (with any [[...]] slots filled) and then continue.',
                     pattern: pattern,
                 },
             },
@@ -2250,6 +2298,7 @@ async function onChatCompletionSettingsReady(generateData) {
     //            and only constrain the *output wrapper* (we append to the existing message locally).
     let schemaPrefix = '';
     let joinSuffixRegex = '';
+    let mustEndAfterTemplate = false;
     let prefillTemplate = String(tailContent ?? '');
 
     if (isContinue) {
@@ -2384,6 +2433,10 @@ async function onChatCompletionSettingsReady(generateData) {
         // Converting literal quotes to curly quotes avoids needing escapes and dramatically improves robustness.
         prefillTemplate = curlyQuoteLiteralsOutsideSlots(prefillTemplate);
 
+        const endSplit = splitEndPrefillTemplate(prefillTemplate);
+        prefillTemplate = endSplit.template;
+        mustEndAfterTemplate = endSplit.hasEndMarker;
+
         schemaPrefix = prefillTemplate;
         runtimeState.newlineToken = chooseNewlineToken(schemaPrefix, settings.newline_token);
         if (settings.hide_prefill_in_display) {
@@ -2426,8 +2479,8 @@ async function onChatCompletionSettingsReady(generateData) {
     }
 
     const minCharsSetting = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);
-    const minCharsAfterPrefix = isContinue ? 1 : minCharsSetting;
-    generateData.json_schema = buildJsonSchemaForPrefillValuePattern(schemaPrefix, minCharsAfterPrefix, joinSuffixRegex);
+    const minCharsAfterPrefix = isContinue ? 1 : (mustEndAfterTemplate ? 0 : minCharsSetting);
+    generateData.json_schema = buildJsonSchemaForPrefillValuePattern(schemaPrefix, minCharsAfterPrefix, joinSuffixRegex, { mustEndAfterTemplate });
 
     // Debug: log the structured output regex pattern that we inject.
     try {

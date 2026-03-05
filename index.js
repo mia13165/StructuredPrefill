@@ -62,6 +62,7 @@ const runtimeState = {
     observedMessageId: -1,
     renderQueued: false,
     stopCleanupTimer: null,
+    postStopDomFixTimer: null,
     stopping: false,
     stopSessionAt: 0,
     trackedSwipeId: -1,
@@ -79,6 +80,52 @@ const runtimeState = {
         stopRequested: false,
     },
 };
+
+function clearPostStopDomFixTimer() {
+    if (runtimeState.postStopDomFixTimer) {
+        clearTimeout(runtimeState.postStopDomFixTimer);
+        runtimeState.postStopDomFixTimer = null;
+    }
+}
+
+function schedulePostStopDomFix(messageId, sessionAtStop) {
+    clearPostStopDomFixTimer();
+
+    let attemptsLeft = 6;
+    const tick = () => {
+        // If a new generation started, don't interfere.
+        if (runtimeState.lastInjectedAt !== sessionAtStop) {
+            runtimeState.postStopDomFixTimer = null;
+            return;
+        }
+
+        const message = chat?.[messageId];
+        if (!message || message.is_user) {
+            runtimeState.postStopDomFixTimer = null;
+            return;
+        }
+
+        try {
+            const textEl = document.querySelector(`.mes[mesid="${messageId}"] .mes_text`);
+            const domText = textEl instanceof HTMLElement ? String(textEl.textContent ?? '') : '';
+            if (looksLikeStructuredJsonBlob(domText)) {
+                updateMessageBlock(messageId, message, { rerenderMessage: true });
+            }
+        } catch {
+            // ignore
+        }
+
+        attemptsLeft--;
+        if (attemptsLeft <= 0) {
+            runtimeState.postStopDomFixTimer = null;
+            return;
+        }
+
+        runtimeState.postStopDomFixTimer = setTimeout(tick, 450);
+    };
+
+    runtimeState.postStopDomFixTimer = setTimeout(tick, 250);
+}
 
 function getChatScrollElement() {
     const el = document.getElementById('chat');
@@ -357,8 +404,8 @@ function prefixHasSlots(prefix) {
 function looksLikeStructuredJsonBlob(text) {
     const s = String(text ?? '');
     if (!s.includes('{') || !s.includes('"')) return false;
-    // Detect our JSON wrapper even if it appears *after* a Continue base message ("Foo... {\"value\":\"...\"}").
-    return /\{\s*"(?:value|prefix|content)"\s*:/.test(s);
+    // Detect our JSON wrapper even if it appears *after* a Continue base message ("Foo... {\"response\":\"...\"}").
+    return /\{\s*"(?:response|value|prefix|content)"\s*:/.test(s);
 }
 
 function clearHidePrefillState() {
@@ -440,10 +487,15 @@ function getDecodedValueForGuard(rawText) {
     const decode = (s) => decodeNewlines(s, runtimeState.newlineToken);
     try {
         const parsed = JSON.parse(String(rawText ?? ''));
-        if (parsed && typeof parsed === 'object' && typeof parsed.value === 'string') return decode(parsed.value);
+        if (parsed && typeof parsed === 'object') {
+            if (typeof parsed.response === 'string') return decode(parsed.response);
+            if (typeof parsed.value === 'string') return decode(parsed.value);
+        }
     } catch {
         // ignore
     }
+    const response = tryExtractJsonStringField(String(rawText ?? ''), 'response');
+    if (typeof response === 'string') return decode(response);
     const legacy = tryExtractJsonStringField(String(rawText ?? ''), 'value');
     if (typeof legacy === 'string') return decode(legacy);
     return null;
@@ -1569,23 +1621,19 @@ function buildJsonSchemaForPrefillValuePattern(prefix, minCharsAfterPrefix, join
     }
 
     return {
-        name: 'structured_prefill',
-        description: mustEndAfterTemplate
-            ? 'Constrain output so it matches the prefix template exactly (no extra continuation).'
-            : 'Constrain output so it begins with a prefix (prefill-like) and continues with additional content.',
+        name: 'response',
+        description: '',
         strict: true,
         value: {
             type: 'object',
             properties: {
-                value: {
+                response: {
                     type: 'string',
-                    description: mustEndAfterTemplate
-                        ? 'Full assistant reply text. Must match the required prefix template (with any [[...]] slots filled) and then end.'
-                        : 'Full assistant reply text. Must start with the required prefix template (with any [[...]] slots filled) and then continue.',
+                    description: '',
                     pattern: pattern,
                 },
             },
-            required: ['value'],
+            required: ['response'],
             additionalProperties: false,
         },
     };
@@ -1808,6 +1856,10 @@ function tryUnwrapStructuredOutput(text) {
     try {
         const parsed = JSON.parse(text);
         if (parsed && typeof parsed === 'object') {
+            if (typeof parsed.response === 'string') {
+                const decoded = decode(parsed.response);
+                return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
+            }
             if (typeof parsed.value === 'string') {
                 // Back-compat with older schema.
                 const decoded = decode(parsed.value);
@@ -1825,9 +1877,14 @@ function tryUnwrapStructuredOutput(text) {
         }
     } catch {
         // JSON.parse failed. Some providers/models still *mostly* follow the schema but emit invalid JSON,
-        // commonly due to unescaped quotes inside the `value` string (causing early termination).
+        // commonly due to unescaped quotes inside the structured string field (causing early termination).
         //
         // Use a tolerant extractor first; fall back to strict extraction only if needed.
+        const looseResponse = tryExtractJsonStringFieldLoose(text, 'response');
+        if (typeof looseResponse === 'string') {
+            const decoded = decode(looseResponse);
+            return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
+        }
         const looseValue = tryExtractJsonStringFieldLoose(text, 'value');
         if (typeof looseValue === 'string') {
             const decoded = decode(looseValue);
@@ -1842,6 +1899,12 @@ function tryUnwrapStructuredOutput(text) {
         }
 
         // Fall back to partial extraction (useful during early streaming).
+    }
+
+    const response = tryExtractJsonStringField(text, 'response');
+    if (typeof response === 'string') {
+        const decoded = decode(response);
+        return runtimeState.continue.active ? applyContinueJoin(decoded) : decoded;
     }
 
     // Back-compat: single-field schema.
@@ -2071,7 +2134,7 @@ function clearStopCleanupTimer() {
 
 function getRawCandidateForMessage(messageId) {
     const mes = chat?.[messageId]?.mes;
-    if (typeof mes === 'string' && mes.includes('"value"')) return mes;
+    if (typeof mes === 'string' && (mes.includes('"response"') || mes.includes('"value"'))) return mes;
     const latest = String(runtimeState.latestStreamText ?? '');
     if (latest.trimStart().startsWith('{')) return latest;
     return mes || latest || '';
@@ -2202,6 +2265,10 @@ function touchStopCleanup(messageId, sessionAtStop) {
             console.debug(`[${extensionName}] Stop cleanup: no valid text to apply, skipping render`);
         }
 
+        // Some backends keep streaming briefly after Stop, and ST can repaint raw JSON after we've unwrapped.
+        // A short post-stop watchdog re-renders the block if that happens.
+        schedulePostStopDomFix(messageId, sessionAtStop);
+
         runtimeState.active = false;
         runtimeState.stopping = false;
         runtimeState.trackedSwipeId = -1;
@@ -2210,13 +2277,15 @@ function touchStopCleanup(messageId, sessionAtStop) {
         clearHidePrefillState();
         clearContinueState();
         resetStreamGuard();
-    }, 250);
+    }, 900);
 }
 
 async function onChatCompletionSettingsReady(generateData) {
     const settings = extension_settings[extensionName];
     if (!settings?.enabled) return;
     if (!generateData || typeof generateData !== 'object') return;
+
+    clearPostStopDomFixTimer();
 
     if (!supportsStructuredPrefillForSource(generateData.chat_completion_source)) return;
     if (generateData.json_schema) return;
@@ -2227,7 +2296,7 @@ async function onChatCompletionSettingsReady(generateData) {
 
     // Impersonate and quiet (e.g. summarization) don't produce chat messages — they write to
     // the input textarea or return text silently. Injecting structured output would break them:
-    // the model returns `{"value":"..."}` JSON that ST can't use, and the stream observer would
+    // the model returns `{"response":"..."}` JSON that ST can't use, and the stream observer would
     // incorrectly overwrite the last assistant message.
     if (requestType === 'impersonate' || requestType === 'quiet') return;
 
@@ -2484,8 +2553,9 @@ async function onChatCompletionSettingsReady(generateData) {
 
     // Debug: log the structured output regex pattern that we inject.
     try {
-        console.debug(`[${extensionName}] Injecting structured prefill: source=${src} model=${modelId} schema=value.pattern mode=${runtimeState.patternMode}`);
-        const injectedPattern = generateData?.json_schema?.value?.properties?.value?.pattern;
+        console.debug(`[${extensionName}] Injecting structured prefill: source=${src} model=${modelId} schema=response.pattern mode=${runtimeState.patternMode}`);
+        const injectedPattern = generateData?.json_schema?.value?.properties?.response?.pattern
+            ?? generateData?.json_schema?.value?.properties?.value?.pattern;
         if (typeof injectedPattern === 'string' && injectedPattern.length > 0) {
             console.debug(`[${extensionName}] Injected json_schema pattern (${injectedPattern.length} chars):`, injectedPattern);
             const continueBaseLen = runtimeState.continue.active ? String(runtimeState.continue.baseText ?? '').length : 0;
@@ -2551,6 +2621,7 @@ function scheduleStreamUnwrap(rawText) {
 
 function onMessageReceived(messageId) {
     if (!runtimeState.active) return;
+    clearPostStopDomFixTimer();
 
     const raw = getRawCandidateForMessage(messageId);
     const unwrapped = tryUnwrapStructuredOutput(String(raw));
@@ -2569,6 +2640,7 @@ function onMessageReceived(messageId) {
 
 function onGenerationStopped() {
     if (!runtimeState.active) return;
+    clearPostStopDomFixTimer();
 
     const messageId = getActiveAssistantMessageIdForStreaming();
     runtimeState.stopping = true;

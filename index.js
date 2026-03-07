@@ -2542,9 +2542,7 @@ async function onChatCompletionSettingsReady(generateData) {
         // Non-Continue: if we end on assistant, this is assistant-prefill and many providers reject it with output formats.
         if (!isContinue && lastMsg?.role === 'assistant') return;
 
-        // Anthropic/OpenRouter strictness: if the request still doesn't end on user, do not inject structured outputs.
-        // (We intentionally avoid mutating system messages.)
-        if (runtimeState.patternMode === 'anthropic' && lastMsg?.role !== 'user') return;
+        if (runtimeState.patternMode === 'anthropic' && lastMsg?.role !== 'user' && lastMsg?.role !== 'system') return;
     }
 
     const minCharsSetting = clampInt(settings.min_chars_after_prefix, 1, 10000, 80);

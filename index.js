@@ -21,10 +21,13 @@ const defaultSettings = {
     // Prefill Generator: if the prefill template contains `[[pg]]`, we run a separate (non-streaming) generation
     // using a different connection profile and splice the output into the template before injecting json_schema.
     prefill_gen_enabled: false,
+    prefill_gen_extra_prompt: '',
+    prefill_gen_extra_prompt_role: 'system',
     prefill_gen_profile_id: '',
     prefill_gen_max_tokens: 15,
     prefill_gen_stop: '',
-    prefill_gen_timeout_ms: 12000,
+    prefill_gen_keep_matched_stop_string: false,
+    prefill_gen_timeout_ms: 120000,
 };
 
 const runtimeState = {
@@ -201,8 +204,17 @@ function schedulePostFrameGuard(messageId) {
 
 function loadSettings() {
     extension_settings[extensionName] ??= {};
+    if (
+        extension_settings[extensionName].prefill_gen_keep_matched_stop_string == null &&
+        extension_settings[extensionName].prefill_gen_include_profile_stop_strings != null
+    ) {
+        extension_settings[extensionName].prefill_gen_keep_matched_stop_string = !!extension_settings[extensionName].prefill_gen_include_profile_stop_strings;
+    }
     for (const [key, value] of Object.entries(defaultSettings)) {
         extension_settings[extensionName][key] ??= value;
+    }
+    if (clampInt(extension_settings[extensionName].prefill_gen_timeout_ms, 500, 120000, 120000) === 12000) {
+        extension_settings[extensionName].prefill_gen_timeout_ms = 120000;
     }
 }
 
@@ -228,6 +240,114 @@ function parseStopStrings(raw) {
     const s = String(raw ?? '');
     const lines = s.split(/\r?\n/g).map(x => String(x ?? '').trim()).filter(Boolean);
     return lines;
+}
+
+function normalizeStopStrings(...lists) {
+    const merged = [];
+    const seen = new Set();
+
+    for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        for (const item of list) {
+            const value = String(item ?? '').trim();
+            if (!value || seen.has(value)) continue;
+            seen.add(value);
+            merged.push(value);
+        }
+    }
+
+    return merged;
+}
+
+function detectMatchedStopStringFromCompletionResponse(data, stopStrings) {
+    const normalizedStops = normalizeStopStrings(stopStrings);
+    if (!normalizedStops.length) {
+        return '';
+    }
+
+    const explicitStopValues = [
+        data?.choices?.[0]?.stop_sequence,
+        data?.choices?.[0]?.message?.stop_sequence,
+        data?.choices?.[0]?.delta?.stop_sequence,
+        data?.choices?.[0]?.matched_stop,
+        data?.choices?.[0]?.message?.matched_stop,
+        data?.stop_sequence,
+        data?.matched_stop,
+        data?.completion?.stop_sequence,
+    ];
+
+    for (const value of explicitStopValues) {
+        if (typeof value === 'string' && normalizedStops.includes(value)) {
+            return value;
+        }
+    }
+
+    // Best-effort fallback for providers that only report a generic stop finish reason.
+    if (normalizedStops.length !== 1) {
+        return '';
+    }
+
+    const stopReasons = [
+        data?.choices?.[0]?.finish_reason,
+        data?.choices?.[0]?.native_finish_reason,
+        data?.choices?.[0]?.stop_reason,
+        data?.choices?.[0]?.finishReason,
+        data?.finish_reason,
+        data?.stop_reason,
+        data?.candidateFinishReason,
+        data?.candidates?.[0]?.finishReason,
+    ]
+        .filter(value => typeof value === 'string')
+        .map(value => value.trim().toLowerCase())
+        .filter(Boolean);
+
+    const stopLikeReasons = new Set(['stop', 'stop_sequence', 'stop sequence', 'stop_sequence_reached', 'eos']);
+    const nonStopReasons = new Set(['length', 'max_tokens', 'max_output_tokens', 'tool_calls', 'tool_call', 'function_call', 'content_filter', 'safety', 'recitation', 'error', 'end_turn', 'endturn', 'tool_use', 'tool_result']);
+
+    if (stopReasons.some(reason => nonStopReasons.has(reason))) {
+        return '';
+    }
+
+    return stopReasons.some(reason => stopLikeReasons.has(reason)) ? normalizedStops[0] : '';
+}
+
+function appendMatchedStopString(text, stopString) {
+    const generatedText = String(text ?? '');
+    const matchedStopString = String(stopString ?? '');
+
+    if (!matchedStopString || generatedText.endsWith(matchedStopString)) {
+        return generatedText;
+    }
+
+    return `${generatedText}${matchedStopString}`;
+}
+
+function normalizePrefillGenExtraPromptRole(raw) {
+    const role = String(raw ?? 'system').trim().toLowerCase();
+    if (role === 'user' || role === 'assistant') return role;
+    return 'system';
+}
+
+function insertPrefillGenExtraPrompt(messages, prompt, role) {
+    const content = String(prompt ?? '');
+    const normalizedRole = normalizePrefillGenExtraPromptRole(role);
+    const nextMessages = Array.isArray(messages) ? messages.map(m => ({ ...m })) : [];
+
+    if (!content.trim()) {
+        return { messages: nextMessages, useSysprompt: false };
+    }
+
+    if (normalizedRole === 'system') {
+        let insertAt = 0;
+        while (insertAt < nextMessages.length && nextMessages[insertAt]?.role === 'system') {
+            insertAt++;
+        }
+        nextMessages.splice(insertAt, 0, { role: 'system', content });
+        return { messages: nextMessages, useSysprompt: true };
+    }
+
+    nextMessages.push({ role: normalizedRole, content });
+    return { messages: nextMessages, useSysprompt: false };
 }
 
 function getConnectionProfilesSafe() {
@@ -281,7 +401,17 @@ function extractPlainTextFromCompletionResponse(data) {
     return '';
 }
 
-async function runPrefillGeneratorOrEmpty({ generateData, tailIndex, timeoutMs, maxTokens, stopStrings, profileId }) {
+async function runPrefillGeneratorOrEmpty({
+    generateData,
+    tailIndex,
+    timeoutMs,
+    maxTokens,
+    stopStrings,
+    profileId,
+    extraPrompt,
+    extraPromptRole,
+    keepMatchedStopString,
+}) {
     const profiles = getConnectionProfilesSafe();
     const profile = profiles.find(p => String(p?.id ?? '') === String(profileId ?? '')) ?? null;
     if (!profile) {
@@ -315,15 +445,25 @@ async function runPrefillGeneratorOrEmpty({ generateData, tailIndex, timeoutMs, 
         baseMessages[baseMessages.length - 1] = { ...last, role: 'user' };
     }
 
+    const insertedPrompt = insertPrefillGenExtraPrompt(baseMessages, extraPrompt, extraPromptRole);
+    const requestMessages = insertedPrompt.messages;
+    const normalizedStopStrings = normalizeStopStrings(stopStrings);
+
+    // OpenRouter and direct Claude are the main cases that reject a trailing assistant role here.
+    const finalMessage = requestMessages[requestMessages.length - 1];
+    if (finalMessage?.role === 'assistant' && (source === 'openrouter' || source === 'claude')) {
+        requestMessages[requestMessages.length - 1] = { ...finalMessage, role: 'user' };
+    }
+
     const payload = {
         type: 'quiet',
-        messages: baseMessages,
+        messages: requestMessages,
         model: model,
         temperature: 1,
         top_p: 1,
         max_tokens: maxTokens,
         stream: false,
-        stop: (Array.isArray(stopStrings) && stopStrings.length) ? stopStrings : undefined,
+        stop: normalizedStopStrings.length ? normalizedStopStrings : undefined,
         chat_completion_source: source,
         user_name: generateData?.user_name,
         char_name: generateData?.char_name,
@@ -342,8 +482,13 @@ async function runPrefillGeneratorOrEmpty({ generateData, tailIndex, timeoutMs, 
         payload.custom_url = url;
     }
 
+    if (insertedPrompt.useSysprompt) {
+        payload.use_sysprompt = true;
+    }
+
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), Math.max(500, timeoutMs));
+    const configuredTimeoutMs = clampInt(timeoutMs, 500, 120000, 120000);
+    const timer = setTimeout(() => controller.abort(), configuredTimeoutMs);
 
     try {
         const res = await fetch('/api/backends/chat-completions/generate', {
@@ -364,7 +509,19 @@ async function runPrefillGeneratorOrEmpty({ generateData, tailIndex, timeoutMs, 
             throw new Error(`Prefill generator: ${msg}`);
         }
 
-        return extractPlainTextFromCompletionResponse(data);
+        const generatedText = extractPlainTextFromCompletionResponse(data);
+        if (!keepMatchedStopString) {
+            return generatedText;
+        }
+
+        const matchedStopString = detectMatchedStopStringFromCompletionResponse(data, normalizedStopStrings);
+        return appendMatchedStopString(generatedText, matchedStopString);
+    } catch (error) {
+        if (error?.name === 'AbortError' && controller.signal.aborted) {
+            throw new Error(`Prefill generator timed out after ${configuredTimeoutMs} ms.`);
+        }
+
+        throw error;
     } finally {
         clearTimeout(timer);
     }
@@ -2459,8 +2616,11 @@ async function onChatCompletionSettingsReady(generateData) {
         if (templateHasPrefillGenSlot(prefillTemplate)) {
             const profileId = String(settings.prefill_gen_profile_id ?? '');
             const maxTokens = clampInt(settings.prefill_gen_max_tokens, 1, 2048, 15);
-            const timeoutMs = clampInt(settings.prefill_gen_timeout_ms, 500, 120000, 12000);
+            const timeoutMs = clampInt(settings.prefill_gen_timeout_ms, 500, 120000, 120000);
             const stopStrings = parseStopStrings(settings.prefill_gen_stop);
+            const extraPrompt = String(settings.prefill_gen_extra_prompt ?? '');
+            const extraPromptRole = normalizePrefillGenExtraPromptRole(settings.prefill_gen_extra_prompt_role);
+            const keepMatchedStopString = !!settings.prefill_gen_keep_matched_stop_string;
 
             let generated = '';
             if (settings.prefill_gen_enabled) {
@@ -2472,6 +2632,9 @@ async function onChatCompletionSettingsReady(generateData) {
                         maxTokens,
                         stopStrings,
                         profileId,
+                        extraPrompt,
+                        extraPromptRole,
+                        keepMatchedStopString,
                     });
                 } catch (err) {
                     try {
@@ -2663,9 +2826,12 @@ function renderSettingsToUi() {
     $('#structuredprefill_hide_prefill_in_display').prop('checked', !!settings.hide_prefill_in_display);
     $('#structuredprefill_min_chars_after_prefix').val(String(settings.min_chars_after_prefix ?? 80));
     $('#structuredprefill_prefill_gen_enabled').prop('checked', !!settings.prefill_gen_enabled);
+    $('#structuredprefill_prefill_gen_extra_prompt').val(String(settings.prefill_gen_extra_prompt ?? ''));
+    $('#structuredprefill_prefill_gen_extra_prompt_role').val(normalizePrefillGenExtraPromptRole(settings.prefill_gen_extra_prompt_role));
     $('#structuredprefill_prefill_gen_max_tokens').val(String(settings.prefill_gen_max_tokens ?? 15));
     $('#structuredprefill_prefill_gen_stop').val(String(settings.prefill_gen_stop ?? ''));
-    $('#structuredprefill_prefill_gen_timeout_ms').val(String(settings.prefill_gen_timeout_ms ?? 12000));
+    $('#structuredprefill_prefill_gen_keep_matched_stop_string').prop('checked', !!settings.prefill_gen_keep_matched_stop_string);
+    $('#structuredprefill_prefill_gen_timeout_ms').val(String(settings.prefill_gen_timeout_ms ?? 120000));
     renderPrefillGenProfileSelect();
     $('#structuredprefill_newline_token').val(String(settings.newline_token ?? '<NL>'));
     $('#structuredprefill_continue_overlap_chars').val(String(settings.continue_overlap_chars ?? 14));
@@ -2702,6 +2868,21 @@ function setupUiListeners() {
             saveSettingsDebounced();
         });
 
+    $('#structuredprefill_prefill_gen_extra_prompt')
+        .off('input')
+        .on('input', () => {
+            extension_settings[extensionName].prefill_gen_extra_prompt = String($('#structuredprefill_prefill_gen_extra_prompt').val() ?? '');
+            saveSettingsDebounced();
+        });
+
+    $('#structuredprefill_prefill_gen_extra_prompt_role')
+        .off('change')
+        .on('change', () => {
+            extension_settings[extensionName].prefill_gen_extra_prompt_role = normalizePrefillGenExtraPromptRole($('#structuredprefill_prefill_gen_extra_prompt_role').val());
+            $('#structuredprefill_prefill_gen_extra_prompt_role').val(extension_settings[extensionName].prefill_gen_extra_prompt_role);
+            saveSettingsDebounced();
+        });
+
     $('#structuredprefill_prefill_gen_profile')
         .off('change')
         .on('change', () => {
@@ -2724,10 +2905,17 @@ function setupUiListeners() {
             saveSettingsDebounced();
         });
 
+    $('#structuredprefill_prefill_gen_keep_matched_stop_string')
+        .off('click')
+        .on('click', () => {
+            extension_settings[extensionName].prefill_gen_keep_matched_stop_string = !!$('#structuredprefill_prefill_gen_keep_matched_stop_string').prop('checked');
+            saveSettingsDebounced();
+        });
+
     $('#structuredprefill_prefill_gen_timeout_ms')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].prefill_gen_timeout_ms = clampInt($('#structuredprefill_prefill_gen_timeout_ms').val(), 500, 120000, 12000);
+            extension_settings[extensionName].prefill_gen_timeout_ms = clampInt($('#structuredprefill_prefill_gen_timeout_ms').val(), 500, 120000, 120000);
             $('#structuredprefill_prefill_gen_timeout_ms').val(String(extension_settings[extensionName].prefill_gen_timeout_ms));
             saveSettingsDebounced();
         });

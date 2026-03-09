@@ -1,16 +1,71 @@
-.structuredprefill-center-text {
-    display: block;
-    text-align: center;
-}
-
 .structuredprefill-settings-group {
-    border: 1px solid var(--SmartThemeBorderColor);
-    border-radius: 5px;
-    padding: 5px 7px;
-    margin-bottom: 2px;
+    margin-bottom: 8px;
 }
 
-.structuredprefill-settings-group > *:last-child {
+.structuredprefill-settings-group > .inline-drawer-header {
+    margin-bottom: 0;
+}
+
+#extensions_settings .structuredprefill_settings .structuredprefill-section-toggle.inline-drawer-header,
+#extensions_settings2 .structuredprefill_settings .structuredprefill-section-toggle.inline-drawer-header,
+.structuredprefill_settings .structuredprefill-section-toggle.inline-drawer-header {
+    padding: 7px 10px 7px 12px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-left: 3px solid var(--SmartThemeQuoteColor);
+    border-radius: 8px;
+    background: linear-gradient(180deg, var(--black40a) 0%, var(--black20a) 100%);
+    background-image: linear-gradient(180deg, var(--black40a) 0%, var(--black20a) 100%);
+    transition:
+        background-color var(--animation-duration-2x),
+        border-color var(--animation-duration-2x),
+        filter var(--animation-duration-2x);
+}
+
+#extensions_settings .structuredprefill_settings .structuredprefill-section-toggle.inline-drawer-header:hover,
+#extensions_settings2 .structuredprefill_settings .structuredprefill-section-toggle.inline-drawer-header:hover,
+.structuredprefill_settings .structuredprefill-section-toggle.inline-drawer-header:hover {
+    filter: brightness(120%);
+}
+
+.structuredprefill-section-label {
+    display: inline-flex;
+    align-items: center;
+    font-weight: 600;
+}
+
+.structuredprefill-section-toggle > .inline-drawer-icon {
+    position: relative;
+    width: 14px;
+    min-width: 14px;
+    height: 14px;
+    font-size: 0;
+    filter: none;
+    opacity: 0.75;
+}
+
+.structuredprefill-section-toggle > .inline-drawer-icon::before {
+    content: "\f078";
+    display: block;
+    font-family: "Font Awesome 6 Free";
+    font-size: 13px;
+    font-style: normal;
+    font-weight: 900;
+    line-height: 14px;
+}
+
+.structuredprefill-section-toggle > .inline-drawer-icon.up::before {
+    content: "\f077";
+}
+
+.structuredprefill-section-content {
+    margin: 4px 0 0 12px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    padding: 8px 10px;
+    background-color: var(--black30a);
+}
+
+.structuredprefill-section-content > *:last-child {
     padding-bottom: 0;
     margin-bottom: 0;
 }

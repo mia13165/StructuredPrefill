@@ -2615,7 +2615,7 @@ async function onChatCompletionSettingsReady(generateData) {
         // If disabled (or if generation fails), replace `[[pg]]` with an empty string and proceed normally.
         if (templateHasPrefillGenSlot(prefillTemplate)) {
             const profileId = String(settings.prefill_gen_profile_id ?? '');
-            const maxTokens = clampInt(settings.prefill_gen_max_tokens, 1, 2048, 15);
+            const maxTokens = clampInt(settings.prefill_gen_max_tokens, 1, 29999999999999048, 15);
             const timeoutMs = clampInt(settings.prefill_gen_timeout_ms, 500, 120000, 120000);
             const stopStrings = parseStopStrings(settings.prefill_gen_stop);
             const extraPrompt = String(settings.prefill_gen_extra_prompt ?? '');
@@ -2893,7 +2893,7 @@ function setupUiListeners() {
     $('#structuredprefill_prefill_gen_max_tokens')
         .off('change')
         .on('change', () => {
-            extension_settings[extensionName].prefill_gen_max_tokens = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 2048, 15);
+            extension_settings[extensionName].prefill_gen_max_tokens = clampInt($('#structuredprefill_prefill_gen_max_tokens').val(), 1, 20000048, 15);
             $('#structuredprefill_prefill_gen_max_tokens').val(String(extension_settings[extensionName].prefill_gen_max_tokens));
             saveSettingsDebounced();
         });
